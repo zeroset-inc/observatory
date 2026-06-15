@@ -125,8 +125,37 @@ GOOGLE_API_KEY=
 OBSERVATORY_ALLOWED_ORIGINS=http://localhost:3003
 ```
 
-Deployments are owned by Cloudflare Workers now. Apply migrations with `bun run db:migrate:remote`, then deploy with `bun run deploy`.
-Before the first deploy, create the D1 database with `wrangler d1 create observatory` and replace `REPLACE_WITH_D1_DATABASE_ID` in `wrangler.toml` with the returned database ID.
+Deployments are owned by Cloudflare Workers now. The Worker is bound to custom domains:
+
+- Production: `observatory.zeroset.com`
+- Production alias: `observatory.trynebula.ai`
+- Staging: `observatory-staging.zeroset.com`
+- Staging alias: `observatory-staging.trynebula.ai`
+
+Before the first deploy, provision Cloudflare resources:
+
+```bash
+# Production D1 (`observatory`) is Terraform-managed in the Nebula repo.
+wrangler d1 create observatory-staging
+wrangler queues create observatory-runner
+wrangler queues create observatory-runner-staging
+```
+
+The Observatory deploy workflow resolves D1 IDs by database name and injects them into `wrangler.toml` at deploy time.
+
+Set GitHub Actions configuration in `zeroset-inc/observatory`:
+
+```bash
+gh variable set CLOUDFLARE_ACCOUNT_ID --repo zeroset-inc/observatory --body <account-id>
+gh secret set CLOUDFLARE_API_TOKEN --repo zeroset-inc/observatory
+gh secret set OBSERVATORY_SECRET --repo zeroset-inc/observatory
+```
+
+The Cloudflare token should be Observatory-specific and scoped to the target account/zones with Workers, D1, Queues, and Worker custom-domain/route permissions.
+
+Apply migrations with `bun run db:migrate:remote`, then deploy production with `bun run deploy`. Use the GitHub workflow dispatch target `staging` for staging deploys.
+
+Custom-domain cutover requires removing or replacing any previous ingress/DNS ownership for the same `observatory*.zeroset.com` and `observatory*.trynebula.ai` hostnames so Cloudflare Workers can own those hostnames.
 
 Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles.
 

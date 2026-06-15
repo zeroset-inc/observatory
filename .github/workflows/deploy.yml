@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Worker environment to deploy"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
 
 permissions:
   contents: read
@@ -32,6 +41,27 @@ jobs:
       - name: Build UI assets
         run: bun run build
 
+      - name: Select deployment target
+        id: target
+        run: |
+          set -euo pipefail
+          target="${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}"
+          if [ "$target" = "staging" ]; then
+            {
+              echo "wrangler_env=staging"
+              echo "database_name=observatory-staging"
+              echo "database_placeholder=REPLACE_WITH_OBSERVATORY_STAGING_D1_DATABASE_ID"
+              echo "queue_name=observatory-runner-staging"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "wrangler_env="
+              echo "database_name=observatory"
+              echo "database_placeholder=REPLACE_WITH_OBSERVATORY_D1_DATABASE_ID"
+              echo "queue_name=observatory-runner"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Resolve D1 database id and inject into wrangler.toml
         # The "observatory" D1 database is provisioned by Terraform in the nebula
         # monorepo (infra/cloudflare). Resolve its id by name at deploy time so the
@@ -39,24 +69,72 @@ jobs:
         # nebula Terraform to have been applied first (the lookup fails loudly if not).
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          DATABASE_NAME: ${{ steps.target.outputs.database_name }}
+          DATABASE_PLACEHOLDER: ${{ steps.target.outputs.database_placeholder }}
         run: |
-          id=$(bunx wrangler d1 list --json | jq -r '.[] | select(.name == "observatory") | (.uuid // .id)')
-          if [ -z "$id" ] || [ "$id" = "null" ]; then
-            echo "::error::D1 database 'observatory' not found in this Cloudflare account. Apply the nebula infra/cloudflare Terraform first." >&2
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID repository variable is required." >&2
             exit 1
           fi
-          sed -i "s|REPLACE_WITH_D1_DATABASE_ID|${id}|" wrangler.toml
-          echo "Resolved D1 'observatory' id and injected into wrangler.toml."
+          id=$(bunx wrangler d1 list --json | jq -r --arg name "$DATABASE_NAME" '.[] | select(.name == $name) | (.uuid // .id)')
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::error::D1 database '$DATABASE_NAME' not found in this Cloudflare account. Apply the nebula infra/cloudflare Terraform first." >&2
+            exit 1
+          fi
+          sed -i "s|${DATABASE_PLACEHOLDER}|${id}|" wrangler.toml
+          echo "Resolved D1 '$DATABASE_NAME' id and injected into wrangler.toml."
+
+      - name: Ensure Queue exists
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          QUEUE_NAME: ${{ steps.target.outputs.queue_name }}
+        run: |
+          set -euo pipefail
+          if ! bunx wrangler queues list | grep -E "(^|[[:space:]])${QUEUE_NAME}([[:space:]]|$)"; then
+            bunx wrangler queues create "$QUEUE_NAME"
+          fi
 
       - name: Apply D1 migrations
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: bunx wrangler d1 migrations apply observatory --remote
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          DATABASE_NAME: ${{ steps.target.outputs.database_name }}
+          WRANGLER_ENV: ${{ steps.target.outputs.wrangler_env }}
+        run: |
+          if [ -n "$WRANGLER_ENV" ]; then
+            bunx wrangler d1 migrations apply "$DATABASE_NAME" --remote --env "$WRANGLER_ENV"
+          else
+            bunx wrangler d1 migrations apply "$DATABASE_NAME" --remote --env ""
+          fi
+
+      - name: Sync Worker secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OBSERVATORY_SECRET: ${{ secrets.OBSERVATORY_SECRET }}
+          WRANGLER_ENV: ${{ steps.target.outputs.wrangler_env }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OBSERVATORY_SECRET:-}" ]; then
+            echo "::error::OBSERVATORY_SECRET repository secret is required." >&2
+            exit 1
+          fi
+          if [ -n "$WRANGLER_ENV" ]; then
+            printf "%s" "$OBSERVATORY_SECRET" | bunx wrangler secret put OBSERVATORY_SECRET --env "$WRANGLER_ENV"
+          else
+            printf "%s" "$OBSERVATORY_SECRET" | bunx wrangler secret put OBSERVATORY_SECRET --env ""
+          fi
 
       - name: Deploy Worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: bunx wrangler deploy
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_ENV: ${{ steps.target.outputs.wrangler_env }}
+        run: |
+          if [ -n "$WRANGLER_ENV" ]; then
+            bunx wrangler deploy --env "$WRANGLER_ENV"
+          else
+            bunx wrangler deploy --env ""
+          fi

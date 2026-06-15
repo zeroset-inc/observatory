@@ -4,7 +4,15 @@ name = "observatory"
 main = "src/worker.ts"
 compatibility_date = "2026-06-09"
 compatibility_flags = ["nodejs_compat"]
-workers_dev = true
+workers_dev = false
+
+[[routes]]
+pattern = "observatory.zeroset.com"
+custom_domain = true
+
+[[routes]]
+pattern = "observatory.trynebula.ai"
+custom_domain = true
 
 [assets]
 directory = "./ui/dist"
@@ -17,7 +25,7 @@ crons = ["*/5 * * * *"]
 [[d1_databases]]
 binding = "OBSERVATORY_DB"
 database_name = "observatory"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "REPLACE_WITH_OBSERVATORY_D1_DATABASE_ID"
 migrations_dir = "migrations"
 
 [[queues.producers]]
@@ -47,6 +55,54 @@ enabled = true
 head_sampling_rate = 1.0
 
 [vars]
+OBSERVATORY_ALLOWED_ORIGINS = "http://localhost:3003"
+SUPERMEMORY_BASE_URL = "https://api.supermemory.ai"
+NEBULA_BASE_URL = "https://api.trynebula.ai"
+
+[env.staging]
+name = "observatory-staging"
+workers_dev = false
+
+[[env.staging.routes]]
+pattern = "observatory-staging.zeroset.com"
+custom_domain = true
+
+[[env.staging.routes]]
+pattern = "observatory-staging.trynebula.ai"
+custom_domain = true
+
+[env.staging.triggers]
+crons = ["*/5 * * * *"]
+
+[[env.staging.d1_databases]]
+binding = "OBSERVATORY_DB"
+database_name = "observatory-staging"
+database_id = "REPLACE_WITH_OBSERVATORY_STAGING_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[env.staging.queues.producers]]
+binding = "OBSERVATORY_RUNNER_QUEUE"
+queue = "observatory-runner-staging"
+
+[[env.staging.queues.consumers]]
+queue = "observatory-runner-staging"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+
+[[env.staging.durable_objects.bindings]]
+name = "RUN_COORDINATOR"
+class_name = "RunCoordinator"
+
+[[env.staging.durable_objects.bindings]]
+name = "COMPARE_COORDINATOR"
+class_name = "ComparisonCoordinator"
+
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["RunCoordinator", "ComparisonCoordinator"]
+
+[env.staging.vars]
 OBSERVATORY_ALLOWED_ORIGINS = "http://localhost:3003"
 SUPERMEMORY_BASE_URL = "https://api.supermemory.ai"
 NEBULA_BASE_URL = "https://api.trynebula.ai"
