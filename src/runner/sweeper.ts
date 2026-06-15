@@ -1,4 +1,5 @@
 import type { ObservatoryEnv } from "../server/runtime"
+import { RunnerTaskStore } from "./tasks/store"
 import type { RunnerTaskMessage } from "./tasks/types"
 
 const SWEEP_TASK_LIMIT = 100
@@ -19,6 +20,7 @@ export async function sweepRunner(env: ObservatoryEnv): Promise<{
   expiredComparisons: number
 }> {
   const now = new Date().toISOString()
+  const store = new RunnerTaskStore(env.OBSERVATORY_DB)
   const requeueRows = await env.OBSERVATORY_DB
     .prepare(
       `SELECT id
@@ -53,21 +55,44 @@ export async function sweepRunner(env: ObservatoryEnv): Promise<{
     }
   }
 
-  const failed = await env.OBSERVATORY_DB
+  const finalAttemptRows = await env.OBSERVATORY_DB
     .prepare(
-      `UPDATE runner_tasks
-       SET status = 'failed',
-           error = COALESCE(error, 'Task lease expired on final attempt'),
-           claim_token = NULL,
-           lease_expires_at = NULL,
-           completed_at = ?,
-           updated_at = ?
+      `SELECT id
+       FROM runner_tasks
        WHERE status = 'executing'
          AND (lease_expires_at IS NULL OR lease_expires_at < ?)
-         AND attempts >= max_attempts`
+         AND attempts >= max_attempts
+       LIMIT ?`
     )
-    .bind(now, now, now)
-    .run()
+    .bind(now, SWEEP_TASK_LIMIT)
+    .all<TaskRow>()
+
+  let failedExpiredTasks = 0
+  for (const row of finalAttemptRows.results ?? []) {
+    const task = await store.getTask(row.id)
+    const result = await env.OBSERVATORY_DB
+      .prepare(
+        `UPDATE runner_tasks
+         SET status = 'failed',
+             error = COALESCE(error, 'Task lease expired on final attempt'),
+             claim_token = NULL,
+             lease_expires_at = NULL,
+             completed_at = ?,
+             updated_at = ?
+         WHERE id = ?
+           AND status = 'executing'
+           AND (lease_expires_at IS NULL OR lease_expires_at < ?)
+           AND attempts >= max_attempts`
+      )
+      .bind(now, now, row.id, now)
+      .run()
+    if (result.meta.changes > 0) {
+      failedExpiredTasks++
+      if (task) {
+        await store.releaseTerminalTaskFence(task, "Task lease expired on final attempt")
+      }
+    }
+  }
 
   const queuedRows = await env.OBSERVATORY_DB
     .prepare(
@@ -118,7 +143,7 @@ export async function sweepRunner(env: ObservatoryEnv): Promise<{
   return {
     requeuedExpiredTasks,
     replayedQueuedTasks,
-    failedExpiredTasks: failed.meta.changes ?? 0,
+    failedExpiredTasks,
     expiredRuns: expiredRuns.meta.changes ?? 0,
     expiredComparisons: expiredComparisons.meta.changes ?? 0,
   }

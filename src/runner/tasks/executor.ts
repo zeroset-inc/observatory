@@ -397,15 +397,7 @@ async function failComparisonForTask(
 }
 
 async function releaseTerminalTaskFence(store: RunnerTaskStore, task: RunnerTask): Promise<void> {
-  const message = "Task lease expired on final attempt"
-  if (task.phase && task.runId) {
-    await store.incrementRunProgress(task.runId, task.phase, "failed")
-  }
-  if (task.targetType === "comparison") {
-    await failComparisonForTask(store, task, message)
-    return
-  }
-  await failRunForTask(store, task, message)
+  await store.releaseTerminalTaskFence(task, "Task lease expired on final attempt")
 }
 
 async function completeTask(

@@ -699,6 +699,32 @@ export class RunnerTaskStore {
     return true
   }
 
+  async releaseTerminalTaskFence(task: RunnerTask, errorMessage: string): Promise<void> {
+    if (task.phase && task.runId) {
+      await this.incrementRunProgress(task.runId, task.phase, "failed")
+    }
+
+    if (task.targetType === "comparison") {
+      if (!task.compareId) return
+      const leaseToken =
+        typeof task.payload.leaseToken === "string" ? task.payload.leaseToken : null
+      if (!leaseToken) return
+      await this.cancelQueuedComparisonTasks(task.compareId)
+      await this.markComparisonTerminal(
+        task.compareId,
+        leaseToken,
+        task.executionToken,
+        "failed",
+        errorMessage
+      )
+      return
+    }
+
+    if (!task.runId) return
+    await this.cancelQueuedRunTasks(task.runId)
+    await this.markRunTerminal(task.runId, task.executionToken, "failed", errorMessage)
+  }
+
   async markStoppedComparisonTerminalIfIdle(compareId: string): Promise<boolean> {
     const fence = await this.loadComparisonFence(compareId)
     if (
