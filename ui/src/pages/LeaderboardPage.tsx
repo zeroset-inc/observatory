@@ -6,7 +6,7 @@ import { MultiSelect } from "@/components/multi-select"
 import { SingleSelect } from "@/components/single-select"
 import { DataTable, type Column } from "@/components/data-table"
 import { DropdownMenu } from "@/components/dropdown-menu"
-import { EmptyState, TrophyIcon } from "@/components/empty-state"
+import { EmptyState } from "@/components/empty-state"
 import { Search, ChevronDown, ChevronRight } from "lucide-react"
 
 // Provider colors for charts — muted/desaturated palette
@@ -877,7 +877,6 @@ export default function LeaderboardPage() {
           </div>
         ) : entries.length === 0 ? (
           <EmptyState
-            icon={<TrophyIcon />}
             title="No entries yet"
             description="Completed benchmark runs are automatically added to the leaderboard. Start a run from the Runs page to see results here."
           />
