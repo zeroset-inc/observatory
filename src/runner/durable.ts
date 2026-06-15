@@ -510,7 +510,7 @@ export class RunCoordinator implements DurableObject {
       return json({ error: "Run is not active" }, 404)
     }
     const taskStore = new RunnerTaskStore(this.env.OBSERVATORY_DB)
-    await taskStore.cancelQueuedRunTasks(id)
+    await taskStore.cancelRunnableRunTasks(id)
     await taskStore.markStoppedRunTerminalIfIdle(id)
     return json({ message: "Stop requested", runId: id })
   }
@@ -657,7 +657,7 @@ export class ComparisonCoordinator implements DurableObject {
 
     const timestamp = nowIso()
     const taskStore = new RunnerTaskStore(this.env.OBSERVATORY_DB)
-    await taskStore.cancelQueuedComparisonTasks(compareId)
+    await taskStore.cancelRunnableComparisonTasks(compareId)
     for (const run of manifest.runs) {
       await this.env.OBSERVATORY_DB
         .prepare(
@@ -669,7 +669,7 @@ export class ComparisonCoordinator implements DurableObject {
         )
         .bind(timestamp, run.runId)
         .run()
-      await taskStore.cancelQueuedRunTasks(run.runId)
+      await taskStore.cancelRunnableRunTasks(run.runId)
       await taskStore.markStoppedRunTerminalIfIdle(run.runId)
     }
     await taskStore.markStoppedComparisonTerminalIfIdle(compareId)

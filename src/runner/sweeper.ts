@@ -8,6 +8,15 @@ type TaskRow = {
   id: string
 }
 
+type TargetRow = {
+  id: string
+}
+
+type RunJobRow = {
+  id: string
+  run_status: string
+}
+
 async function enqueueTask(env: ObservatoryEnv, taskId: string): Promise<void> {
   await env.OBSERVATORY_RUNNER_QUEUE?.send({ kind: "task.execute", taskId } satisfies RunnerTaskMessage)
 }
@@ -18,6 +27,9 @@ export async function sweepRunner(env: ObservatoryEnv): Promise<{
   failedExpiredTasks: number
   expiredRuns: number
   expiredComparisons: number
+  stoppedRuns: number
+  stoppedComparisons: number
+  repairedTerminalJobs: number
 }> {
   const now = new Date().toISOString()
   const store = new RunnerTaskStore(env.OBSERVATORY_DB)
@@ -111,6 +123,107 @@ export async function sweepRunner(env: ObservatoryEnv): Promise<{
     replayedQueuedTasks++
   }
 
+  const stoppingRunRows = await env.OBSERVATORY_DB
+    .prepare(
+      `SELECT DISTINCT runs.id
+       FROM runs
+       JOIN runner_tasks ON runner_tasks.run_id = runs.id
+       WHERE runs.active_status = 'stopping'
+         AND runner_tasks.status IN ('queued', 'executing')
+       LIMIT ?`
+    )
+    .bind(SWEEP_TASK_LIMIT)
+    .all<TargetRow>()
+
+  let stoppedRuns = 0
+  for (const row of stoppingRunRows.results ?? []) {
+    await store.cancelRunnableRunTasks(row.id)
+    if (await store.markStoppedRunTerminalIfIdle(row.id)) stoppedRuns++
+  }
+
+  const stoppingComparisonRows = await env.OBSERVATORY_DB
+    .prepare(
+      `SELECT DISTINCT comparisons.id
+       FROM comparisons
+       JOIN runner_tasks ON runner_tasks.compare_id = comparisons.id
+       WHERE comparisons.active_status = 'stopping'
+         AND runner_tasks.status IN ('queued', 'executing')
+       LIMIT ?`
+    )
+    .bind(SWEEP_TASK_LIMIT)
+    .all<TargetRow>()
+
+  let stoppedComparisons = 0
+  for (const row of stoppingComparisonRows.results ?? []) {
+    await store.cancelRunnableComparisonTasks(row.id)
+    if (await store.markStoppedComparisonTerminalIfIdle(row.id)) stoppedComparisons++
+  }
+
+  const terminalRunJobRows = await env.OBSERVATORY_DB
+    .prepare(
+      `SELECT runner_jobs.id, runs.status AS run_status
+       FROM runner_jobs
+       JOIN runs ON runs.id = runner_jobs.target_id
+       WHERE runner_jobs.kind = 'run.start'
+         AND runner_jobs.status IN ('queued', 'executing')
+         AND runs.active_status IS NULL
+         AND runs.status IN ('completed', 'failed', 'interrupted')
+       LIMIT ?`
+    )
+    .bind(SWEEP_TASK_LIMIT)
+    .all<RunJobRow>()
+
+  let repairedTerminalJobs = 0
+  for (const row of terminalRunJobRows.results ?? []) {
+    const status = row.run_status === "completed" ? "completed" : "failed"
+    const result = await env.OBSERVATORY_DB
+      .prepare(
+        `UPDATE runner_jobs
+         SET status = ?,
+             error = COALESCE(error, ?),
+             completed_at = COALESCE(completed_at, ?),
+             updated_at = ?,
+             lease_expires_at = ?,
+             claim_token = NULL
+         WHERE id = ?
+           AND status IN ('queued', 'executing')`
+      )
+      .bind(status, "Parent run is already terminal", now, now, now, row.id)
+      .run()
+    if (result.meta.changes > 0) repairedTerminalJobs++
+  }
+
+  const terminalComparisonJobRows = await env.OBSERVATORY_DB
+    .prepare(
+      `SELECT runner_jobs.id
+       FROM runner_jobs
+       JOIN comparisons ON comparisons.id = runner_jobs.target_id
+       WHERE runner_jobs.kind = 'compare.execute'
+         AND runner_jobs.status IN ('queued', 'executing')
+         AND comparisons.active_status IS NULL
+       LIMIT ?`
+    )
+    .bind(SWEEP_TASK_LIMIT)
+    .all<TargetRow>()
+
+  for (const row of terminalComparisonJobRows.results ?? []) {
+    const result = await env.OBSERVATORY_DB
+      .prepare(
+        `UPDATE runner_jobs
+         SET status = 'failed',
+             error = COALESCE(error, 'Parent comparison is inactive before job terminalized'),
+             completed_at = COALESCE(completed_at, ?),
+             updated_at = ?,
+             lease_expires_at = ?,
+             claim_token = NULL
+         WHERE id = ?
+           AND status IN ('queued', 'executing')`
+      )
+      .bind(now, now, now, row.id)
+      .run()
+    if (result.meta.changes > 0) repairedTerminalJobs++
+  }
+
   const expiredRuns = await env.OBSERVATORY_DB
     .prepare(
       `UPDATE runs
@@ -146,5 +259,8 @@ export async function sweepRunner(env: ObservatoryEnv): Promise<{
     failedExpiredTasks,
     expiredRuns: expiredRuns.meta.changes ?? 0,
     expiredComparisons: expiredComparisons.meta.changes ?? 0,
+    stoppedRuns,
+    stoppedComparisons,
+    repairedTerminalJobs,
   }
 }

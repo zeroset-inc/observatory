@@ -521,6 +521,24 @@ export class RunnerTaskStore {
       .run()
   }
 
+  async cancelRunnableRunTasks(runId: string, reason = "Run stop requested"): Promise<void> {
+    const timestamp = nowIso()
+    await this.db
+      .prepare(
+        `UPDATE runner_tasks
+         SET status = 'cancelled',
+             error = ?,
+             completed_at = ?,
+             updated_at = ?,
+             lease_expires_at = NULL,
+             claim_token = NULL
+         WHERE run_id = ?
+           AND status IN ('queued', 'executing')`
+      )
+      .bind(reason, timestamp, timestamp, runId)
+      .run()
+  }
+
   async cancelQueuedComparisonTasks(compareId: string): Promise<void> {
     await this.db
       .prepare(
@@ -533,6 +551,27 @@ export class RunnerTaskStore {
            AND status = 'queued'`
       )
       .bind(nowIso(), nowIso(), compareId)
+      .run()
+  }
+
+  async cancelRunnableComparisonTasks(
+    compareId: string,
+    reason = "Comparison stop requested"
+  ): Promise<void> {
+    const timestamp = nowIso()
+    await this.db
+      .prepare(
+        `UPDATE runner_tasks
+         SET status = 'cancelled',
+             error = ?,
+             completed_at = ?,
+             updated_at = ?,
+             lease_expires_at = NULL,
+             claim_token = NULL
+         WHERE compare_id = ?
+           AND status IN ('queued', 'executing')`
+      )
+      .bind(reason, timestamp, timestamp, compareId)
       .run()
   }
 
@@ -677,11 +716,18 @@ export class RunnerTaskStore {
              error = COALESCE(?, error),
              completed_at = ?,
              updated_at = ?,
-             lease_expires_at = NULL,
+             lease_expires_at = ?,
              claim_token = NULL
          WHERE execution_token = ?`
       )
-      .bind(status === "completed" ? "completed" : "failed", error ?? null, timestamp, timestamp, executionToken)
+      .bind(
+        status === "completed" ? "completed" : "failed",
+        error ?? null,
+        timestamp,
+        timestamp,
+        timestamp,
+        executionToken
+      )
       .run()
   }
 
@@ -791,11 +837,11 @@ export class RunnerTaskStore {
              error = COALESCE(?, error),
              completed_at = ?,
              updated_at = ?,
-             lease_expires_at = NULL,
+             lease_expires_at = ?,
              claim_token = NULL
          WHERE execution_token = ?`
       )
-      .bind(status, error ?? null, timestamp, timestamp, executionToken)
+      .bind(status, error ?? null, timestamp, timestamp, timestamp, executionToken)
       .run()
   }
 }

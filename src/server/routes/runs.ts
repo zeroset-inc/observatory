@@ -625,6 +625,9 @@ function getRunStatus(checkpoint: any, summary: any): string {
   if (checkpoint.status === "failed") {
     return "failed"
   }
+  if (checkpoint.status === "interrupted") {
+    return "partial"
+  }
 
   const questions = Object.values(checkpoint.questions || {}) as any[]
   const hasFailed = questions.some((q: any) => {

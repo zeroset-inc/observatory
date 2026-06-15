@@ -125,4 +125,33 @@ describe("sweepRunner", () => {
       )
     ).toBe(true)
   })
+
+  test("terminal parent runs repair stale queued runner jobs", async () => {
+    const d1 = new FakeD1()
+    d1.allRows = [
+      [],
+      [],
+      [],
+      [],
+      [],
+      [{ id: "job-1", run_status: "interrupted" }],
+      [],
+    ]
+
+    const result = await sweepRunner({
+      OBSERVATORY_DB: d1,
+      OBSERVATORY_RUNNER_QUEUE: {
+        send: async () => {},
+      },
+    } as any)
+
+    expect(result.repairedTerminalJobs).toBe(1)
+    expect(
+      d1.prepared.some((statement) =>
+        statement.sql.includes("UPDATE runner_jobs") &&
+        statement.sql.includes("lease_expires_at = ?") &&
+        statement.bindings.includes("Parent run is already terminal")
+      )
+    ).toBe(true)
+  })
 })
