@@ -128,7 +128,7 @@ OBSERVATORY_ALLOWED_ORIGINS=http://localhost:3003
 Deployments are owned by Cloudflare Workers now. Apply migrations with `bun run db:migrate:remote`, then deploy with `bun run deploy`.
 Before the first deploy, create the D1 database with `wrangler d1 create observatory` and replace `REPLACE_WITH_D1_DATABASE_ID` in `wrangler.toml` with the returned database ID.
 
-The Worker entrypoint registers short background work with `ctx.waitUntil`, but full benchmark execution can exceed Worker post-response limits. Production-scale runs should be moved behind a durable runner, such as Cloudflare Queues plus Durable Objects or Workflows, so cancellation, retries, and progress are coordinated outside a single isolate.
+Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles.
 
 If your UI runs on a different origin than the API, add that origin to `OBSERVATORY_ALLOWED_ORIGINS`. The server only sends `Access-Control-Allow-Origin` for allowlisted origins.
 

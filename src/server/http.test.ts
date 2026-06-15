@@ -1,12 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { createServerFetchHandler } from "./http"
 
-const server = {
-  upgrade() {
-    return false
-  },
-}
-
 function createHandler(overrides: Partial<Parameters<typeof createServerFetchHandler>[0]> = {}) {
   return createServerFetchHandler({
     async checkReadiness() {},
@@ -32,8 +26,7 @@ describe("server http boundary", () => {
         headers: {
           Origin: "http://localhost:3003",
         },
-      }),
-      server
+      })
     )
 
     expect(response?.status).toBe(204)
@@ -56,8 +49,7 @@ describe("server http boundary", () => {
         headers: {
           Origin: "http://localhost:3003",
         },
-      }),
-      server
+      })
     )
 
     expect(response?.status).toBe(503)
@@ -78,8 +70,7 @@ describe("server http boundary", () => {
         headers: {
           Origin: "https://evil.example",
         },
-      }),
-      server
+      })
     )
 
     expect(response?.status).toBe(404)
@@ -106,8 +97,7 @@ describe("server http boundary", () => {
         headers: {
           Origin: "http://localhost:3003",
         },
-      }),
-      server
+      })
     )
 
     expect(response?.status).toBe(200)

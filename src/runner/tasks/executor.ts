@@ -11,7 +11,7 @@ import { createProvider } from "../../providers"
 import type { ObservatoryEnv } from "../../server/runtime"
 import { fetchAllUserKeys } from "../../server/services/apiKeys"
 import { autoAddToLeaderboard } from "../../server/routes/leaderboard"
-import { wsManager } from "../../server/wsManager"
+import { serverEvents } from "../../server/events"
 import type { BenchmarkName } from "../../types/benchmark"
 import type { RunCheckpoint, SamplingConfig } from "../../types/checkpoint"
 import { isRetryableFailure } from "../retry"
@@ -257,7 +257,7 @@ async function checkComparisonFence(
       "failed",
       "Comparison stopped by user"
     )
-    wsManager.broadcast({
+    serverEvents.broadcast({
       type: "compare_stopping",
       compareId: task.compareId,
     })
@@ -358,7 +358,7 @@ async function maybeFinalizeStoppedRun(store: RunnerTaskStore, task: RunnerTask)
   const runnable = await store.getRunnableRunTaskCount(task.runId, task.executionToken)
   if (runnable > 0) return
   await store.markRunTerminal(task.runId, task.executionToken, "interrupted", "Run stopped by user")
-  wsManager.broadcast({
+  serverEvents.broadcast({
     type: "run_stopped",
     runId: task.runId,
     message: "Run stopped by user",
@@ -373,7 +373,7 @@ async function failRunForTask(
   if (!task.runId) return
   await store.cancelQueuedRunTasks(task.runId)
   await store.markRunTerminal(task.runId, task.executionToken, "failed", errorMessage)
-  wsManager.broadcast({
+  serverEvents.broadcast({
     type: "error",
     runId: task.runId,
     message: errorMessage,
@@ -389,7 +389,7 @@ async function failComparisonForTask(
   const { leaseToken } = decodeComparisonLeasePayload(task)
   await store.cancelQueuedComparisonTasks(task.compareId)
   await store.markComparisonTerminal(task.compareId, leaseToken, task.executionToken, "failed", errorMessage)
-  wsManager.broadcast({
+  serverEvents.broadcast({
     type: "error",
     compareId: task.compareId,
     message: errorMessage,
@@ -436,7 +436,7 @@ async function executeBootstrap(
   if (!completed) return
   if (!(await shouldContinueRunAfterTask(store, task))) return
 
-  wsManager.broadcast({
+  serverEvents.broadcast({
     type: "run_started",
     runId: task.runId,
     provider: checkpoint.provider,
@@ -480,6 +480,14 @@ async function executeQuestionPhase(
   if (task.kind === "run.ingest_question") {
     const provider = createProvider(row.provider)
     await provider.initialize(getProviderConfig(row.provider, userKeys))
+    if (task.payload.retryCleanup === true) {
+      const target = checkpoint.questions[task.questionId]
+      if (target?.containerTag) {
+        await provider.clear(target.containerTag)
+        await guard.ensureActive?.()
+        guard.assertActive()
+      }
+    }
     result = await ingestQuestion(provider, benchmark, question, checkpoint, checkpointManager, guard)
   } else if (task.kind === "run.index_question") {
     const provider = createProvider(row.provider)
@@ -567,7 +575,6 @@ async function executeFinalize(
   const completed = await store.completeTask(task.id, claimToken)
   if (!completed) return
 
-  await store.refreshRunSummaryFromQuestions(task.runId)
   await guard.ensureActive?.()
   guard.assertActive()
   await store.markRunTerminal(task.runId, task.executionToken, finalStatus)
@@ -583,7 +590,7 @@ async function executeFinalize(
       )
     }
   }
-  wsManager.broadcast({
+  serverEvents.broadcast({
     type: "run_finished",
     runId: task.runId,
     status: finalStatus,
@@ -776,7 +783,7 @@ async function executeCompareAggregate(
   if (allCompleted) {
     await batchManager.saveManifest(manifest)
     await store.markComparisonTerminal(task.compareId, leaseToken, task.executionToken, "completed")
-    wsManager.broadcast({
+    serverEvents.broadcast({
       type: "compare_complete",
       compareId: task.compareId,
     })
@@ -790,7 +797,7 @@ async function executeCompareAggregate(
     "failed",
     "One or more child runs failed"
   )
-  wsManager.broadcast({
+  serverEvents.broadcast({
     type: "error",
     compareId: task.compareId,
     message: "One or more child runs failed",

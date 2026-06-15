@@ -120,7 +120,8 @@ export async function initializeRunProgressFromQuestions(
 async function getRunQuestionIdsForPhase(
   db: D1Database,
   runId: string,
-  phase: RunTaskPhase
+  phase: RunTaskPhase,
+  questionIds?: string[]
 ): Promise<string[]> {
   const prerequisite = PREREQUISITE_PHASE[phase]
   const prerequisiteSelect = prerequisite
@@ -135,7 +136,9 @@ async function getRunQuestionIdsForPhase(
     .bind(runId)
     .all<{ question_id: string; phase_status: unknown; prerequisite_status?: unknown }>()
 
+  const allowed = questionIds ? new Set(questionIds) : null
   return (rows.results ?? [])
+    .filter((row) => !allowed || allowed.has(row.question_id))
     .filter((row) => {
       try {
         if (isCompletedPhase(row.phase_status)) return false
@@ -155,9 +158,16 @@ export async function enqueueRunPhaseTasks(
     jobId: string
     runId: string
     phase: RunTaskPhase
+    questionIds?: string[]
+    retryCleanup?: boolean
   }
 ): Promise<void> {
-  const questionIds = await getRunQuestionIdsForPhase(env.OBSERVATORY_DB, input.runId, input.phase)
+  const questionIds = await getRunQuestionIdsForPhase(
+    env.OBSERVATORY_DB,
+    input.runId,
+    input.phase,
+    input.questionIds
+  )
 
   for (const questionId of questionIds) {
     await createAndEnqueueTask(env, store, {
@@ -168,7 +178,7 @@ export async function enqueueRunPhaseTasks(
       runId: input.runId,
       questionId,
       phase: input.phase,
-      payload: { questionId },
+      payload: { questionId, retryCleanup: input.retryCleanup === true },
       idempotencyKey: `${input.jobId}:${input.phase}:${questionId}`,
     })
   }
@@ -222,6 +232,7 @@ export async function maybeScheduleNextRunWork(
   const progress = await store.getRunProgress(runId, completedPhase)
   if (!progress) return
   if (progress.completed + progress.failed < progress.total) return
+  await store.refreshRunSummaryFromQuestions(runId)
   if (progress.failed > 0) {
     await enqueueFinalizeTask(env, store, jobId, runId)
     return
@@ -231,7 +242,13 @@ export async function maybeScheduleNextRunWork(
   if (nextPhase) {
     const previous = await store.getRunProgress(runId, completedPhase)
     if (!previous || previous.completed + previous.failed < previous.total) return
-    await enqueueRunPhaseTasks(env, store, { jobId, runId, phase: nextPhase })
+    const jobQuestionIds = await store.getJobQuestionIds(jobId)
+    await enqueueRunPhaseTasks(env, store, {
+      jobId,
+      runId,
+      phase: nextPhase,
+      questionIds: jobQuestionIds.length > 0 ? jobQuestionIds : undefined,
+    })
     return
   }
 

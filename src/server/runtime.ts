@@ -1,6 +1,6 @@
 export interface ObservatoryEnv {
   OBSERVATORY_DB: D1Database
-  OBSERVATORY_RUNNER_QUEUE?: Queue<import("../runner/messages").RunnerMessage>
+  OBSERVATORY_RUNNER_QUEUE?: Queue<import("../runner/tasks/types").RunnerTaskMessage>
   RUN_COORDINATOR?: DurableObjectNamespace
   COMPARE_COORDINATOR?: DurableObjectNamespace
   ASSETS?: Fetcher

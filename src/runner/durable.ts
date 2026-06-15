@@ -1,9 +1,10 @@
 import { batchManager } from "../orchestrator/batch"
 import { setRuntimeEnv, type ObservatoryEnv } from "../server/runtime"
-import type { RunnerMessage, RunStartJob, CompareExecuteJob } from "./messages"
-import { createAndEnqueueRunBootstrap, createAndEnqueueTask } from "./tasks/scheduler"
+import type { RunStartJob, RunRetryQuestionsJob, CompareExecuteJob } from "./messages"
+import { createAndEnqueueRunBootstrap, createAndEnqueueTask, enqueueRunPhaseTasks } from "./tasks/scheduler"
 import { RunnerTaskStore } from "./tasks/store"
 import { RUN_LEASE_TTL_MS } from "./constants"
+import type { RunTaskPhase } from "./tasks/types"
 
 const DELETE_LEASE_TTL_MS = 5 * 60 * 1000
 
@@ -27,8 +28,37 @@ function leaseExpiresIso(ttlMs = RUN_LEASE_TTL_MS): string {
   return new Date(Date.now() + ttlMs).toISOString()
 }
 
-function createJobId(kind: RunnerMessage["kind"], targetId: string): string {
+const RUN_TASK_PHASES: RunTaskPhase[] = ["ingest", "indexing", "search", "evaluate"]
+const PHASE_STATUS_COLUMN: Record<RunTaskPhase, string> = {
+  ingest: "phase_ingest",
+  indexing: "phase_indexing",
+  search: "phase_search",
+  evaluate: "phase_evaluate",
+}
+const PHASE_PENDING_VALUE: Record<RunTaskPhase, string> = {
+  ingest: JSON.stringify({ status: "pending", completedSessions: [] }),
+  indexing: JSON.stringify({ status: "pending" }),
+  search: JSON.stringify({ status: "pending" }),
+  evaluate: JSON.stringify({ status: "pending" }),
+}
+const PREREQUISITE_PHASE: Partial<Record<RunTaskPhase, RunTaskPhase>> = {
+  indexing: "ingest",
+  search: "indexing",
+  evaluate: "search",
+}
+
+function createJobId(kind: RunStartJob["kind"] | CompareExecuteJob["kind"], targetId: string): string {
   return `${kind}:${targetId}:${crypto.randomUUID()}`
+}
+
+function chunks<T>(items: T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+  return out
+}
+
+function phasesFrom(phase: RunTaskPhase): RunTaskPhase[] {
+  return RUN_TASK_PHASES.slice(RUN_TASK_PHASES.indexOf(phase))
 }
 
 async function readJson<T>(request: Request): Promise<T> {
@@ -51,6 +81,11 @@ export class RunCoordinator implements DurableObject {
     return this.state.blockConcurrencyWhile(async () => {
       if (pathname === "/start") {
         return this.start(await readJson<Omit<RunStartJob, "jobId" | "executionToken">>(request))
+      }
+      if (pathname === "/retry-questions") {
+        return this.retryQuestions(
+          await readJson<Omit<RunRetryQuestionsJob, "jobId" | "executionToken">>(request)
+        )
       }
       if (pathname === "/stop") {
         return this.stop(url.searchParams.get("id"))
@@ -223,6 +258,237 @@ export class RunCoordinator implements DurableObject {
     }
 
     return json({ message: "Run enqueued", runId: job.runId })
+  }
+
+  private async resetQuestionsForRetry(
+    runId: string,
+    questionIds: string[],
+    fromPhase: RunTaskPhase
+  ): Promise<void> {
+    const timestamp = nowIso()
+    const resetPhases = phasesFrom(fromPhase)
+    const assignments = resetPhases
+      .map((phase) => `${PHASE_STATUS_COLUMN[phase]} = ?`)
+      .join(", ")
+    const phaseValues = resetPhases.map((phase) => PHASE_PENDING_VALUE[phase])
+
+    for (const questionIdChunk of chunks(questionIds, 80)) {
+      const placeholders = questionIdChunk.map(() => "?").join(", ")
+      await this.env.OBSERVATORY_DB
+        .prepare(
+          `UPDATE questions
+           SET ${assignments}
+           WHERE run_id = ?
+             AND question_id IN (${placeholders})`
+        )
+        .bind(...phaseValues, runId, ...questionIdChunk)
+        .run()
+    }
+
+    if (resetPhases.includes("search")) {
+      for (const questionIdChunk of chunks(questionIds, 98)) {
+        const placeholders = questionIdChunk.map(() => "?").join(", ")
+        await this.env.OBSERVATORY_DB
+          .prepare(
+            `DELETE FROM search_results
+             WHERE run_id = ?
+               AND question_id IN (${placeholders})`
+          )
+          .bind(runId, ...questionIdChunk)
+          .run()
+      }
+    }
+
+    await this.env.OBSERVATORY_DB
+      .prepare("DELETE FROM reports WHERE run_id = ?")
+      .bind(runId)
+      .run()
+
+    await this.env.OBSERVATORY_DB
+      .prepare("UPDATE runs SET updated_at = ? WHERE id = ?")
+      .bind(timestamp, runId)
+      .run()
+  }
+
+  private async validateRetryPrerequisites(
+    runId: string,
+    questionIds: string[],
+    fromPhase: RunTaskPhase
+  ): Promise<string[]> {
+    const prerequisite = PREREQUISITE_PHASE[fromPhase]
+    if (!prerequisite) return []
+    const incomplete: string[] = []
+    const column = PHASE_STATUS_COLUMN[prerequisite]
+
+    for (const questionIdChunk of chunks(questionIds, 98)) {
+      const placeholders = questionIdChunk.map(() => "?").join(", ")
+      const rows = await this.env.OBSERVATORY_DB
+        .prepare(
+          `SELECT question_id, ${column} AS phase_status
+           FROM questions
+           WHERE run_id = ?
+             AND question_id IN (${placeholders})`
+        )
+        .bind(runId, ...questionIdChunk)
+        .all<{ question_id: string; phase_status: string | null }>()
+
+      for (const row of rows.results ?? []) {
+        try {
+          const phase = row.phase_status ? JSON.parse(row.phase_status) : null
+          if (phase?.status !== "completed") incomplete.push(row.question_id)
+        } catch {
+          incomplete.push(row.question_id)
+        }
+      }
+    }
+    return incomplete
+  }
+
+  private async retryQuestions(
+    input: Omit<RunRetryQuestionsJob, "jobId" | "executionToken">
+  ): Promise<Response> {
+    if (input.kind !== "run.retry_questions") {
+      return json({ error: "Invalid retry command" }, 400)
+    }
+    const fromPhase = input.fromPhase as RunTaskPhase
+    if (!RUN_TASK_PHASES.includes(fromPhase)) {
+      return json({ error: `Invalid fromPhase: ${input.fromPhase}` }, 400)
+    }
+    const inputQuestionIds = Array.isArray(input.questionIds) ? input.questionIds : []
+    const questionIds = [...new Set(inputQuestionIds)].filter(
+      (questionId): questionId is string => typeof questionId === "string" && questionId.length > 0
+    )
+    if (questionIds.length === 0) {
+      return json({ error: "questionIds is required and must be non-empty" }, 400)
+    }
+
+    const timestamp = nowIso()
+    const expiresAt = leaseExpiresIso()
+    const run = await this.env.OBSERVATORY_DB
+      .prepare(
+        `SELECT id, active_status, active_lease_expires_at
+         FROM runs
+         WHERE id = ?`
+      )
+      .bind(input.runId)
+      .first<{ id: string; active_status: string | null; active_lease_expires_at: string | null }>()
+    if (!run) return json({ error: "Run not found" }, 404)
+    if (run.active_status && run.active_lease_expires_at && run.active_lease_expires_at >= timestamp) {
+      return json({ error: "Run is already active" }, 409)
+    }
+
+    const found = new Set<string>()
+    for (const questionIdChunk of chunks(questionIds, 98)) {
+      const placeholders = questionIdChunk.map(() => "?").join(", ")
+      const existingQuestions = await this.env.OBSERVATORY_DB
+        .prepare(
+          `SELECT question_id
+           FROM questions
+           WHERE run_id = ?
+             AND question_id IN (${placeholders})`
+        )
+        .bind(input.runId, ...questionIdChunk)
+        .all<{ question_id: string }>()
+      for (const row of existingQuestions.results ?? []) {
+        found.add(row.question_id)
+      }
+    }
+    const missing = questionIds.filter((questionId) => !found.has(questionId))
+    if (missing.length > 0) {
+      return json({ error: `Questions not found: ${missing.join(", ")}` }, 400)
+    }
+    const prerequisiteFailures = await this.validateRetryPrerequisites(input.runId, questionIds, fromPhase)
+    if (prerequisiteFailures.length > 0) {
+      return json(
+        {
+          error: `Cannot retry from ${fromPhase}; prerequisite phase is incomplete for: ${prerequisiteFailures.join(", ")}`,
+        },
+        400
+      )
+    }
+
+    const job: RunRetryQuestionsJob = {
+      ...input,
+      questionIds,
+      jobId: createJobId("run.start", input.runId),
+      executionToken: crypto.randomUUID(),
+    }
+
+    const activated = await this.env.OBSERVATORY_DB
+      .prepare(
+        `UPDATE runs
+         SET active_status = 'running',
+             status = 'running',
+             active_execution_token = ?,
+             active_lease_expires_at = ?,
+             updated_at = ?
+         WHERE id = ?
+           AND (
+             active_status IS NULL
+             OR active_lease_expires_at IS NULL
+             OR active_lease_expires_at < ?
+           )`
+      )
+      .bind(job.executionToken, expiresAt, timestamp, input.runId, timestamp)
+      .run()
+    if (activated.meta.changes === 0) {
+      return json({ error: "Run is already active" }, 409)
+    }
+
+    try {
+      const taskStore = new RunnerTaskStore(this.env.OBSERVATORY_DB)
+      await this.resetQuestionsForRetry(input.runId, questionIds, fromPhase)
+      await taskStore.refreshRunSummaryFromQuestions(input.runId)
+      await this.env.OBSERVATORY_DB
+        .prepare(
+          `INSERT INTO runner_jobs (
+             id, kind, target_id, status, execution_token, attempts,
+             max_attempts, lease_expires_at, created_at, updated_at
+           )
+           VALUES (?, 'run.start', ?, 'queued', ?, 0, 3, ?, ?, ?)`
+        )
+        .bind(job.jobId, job.runId, job.executionToken, expiresAt, timestamp, timestamp)
+        .run()
+
+      for (const phase of phasesFrom(fromPhase)) {
+        await taskStore.setRunProgressCounts(input.runId, phase, {
+          total: questionIds.length,
+          completed: 0,
+          failed: 0,
+        })
+      }
+      await enqueueRunPhaseTasks(this.env, taskStore, {
+        jobId: job.jobId,
+        runId: input.runId,
+        phase: fromPhase,
+        questionIds,
+        retryCleanup: fromPhase === "ingest",
+      })
+    } catch (error) {
+      await this.env.OBSERVATORY_DB
+        .prepare(
+          `UPDATE runs
+           SET active_status = NULL,
+               active_execution_token = NULL,
+               active_lease_expires_at = NULL,
+               status = 'failed',
+               updated_at = ?
+           WHERE id = ?
+             AND active_execution_token = ?`
+        )
+        .bind(nowIso(), input.runId, job.executionToken)
+        .run()
+      await this.env.OBSERVATORY_DB
+        .prepare("UPDATE runner_jobs SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+        .bind(error instanceof Error ? error.message : String(error), nowIso(), job.jobId)
+        .run()
+      return json(
+        { error: error instanceof Error ? error.message : "Failed to enqueue retry" },
+        500
+      )
+    }
+
+    return json({ message: "Retry enqueued", runId: input.runId, questionIds })
   }
 
   private async stop(id: string | null): Promise<Response> {

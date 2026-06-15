@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { enqueueRunPhaseTasks } from "./scheduler"
 import { RunnerTaskStore } from "./store"
 
 class FakeStatement {
@@ -19,7 +20,7 @@ class FakeStatement {
   }
 
   async all() {
-    return { results: [] }
+    return { results: this.db.allRows.shift() ?? [] }
   }
 
   async run() {
@@ -41,6 +42,7 @@ class FakeStatement {
 class FakeD1 {
   prepared: FakeStatement[] = []
   firstRows: Record<string, unknown>[] = []
+  allRows: Record<string, unknown>[][] = []
   runChanges: number[] = []
 
   prepare(sql: string): FakeStatement {
@@ -148,5 +150,108 @@ describe("RunnerTaskStore", () => {
         statement.sql.includes("WHERE execution_token = ?")
       )
     ).toBe(true)
+  })
+
+  test("loads distinct question ids for a runner job", async () => {
+    const d1 = new FakeD1()
+    d1.allRows = [[{ question_id: "q1" }, { question_id: "q2" }]]
+    const store = new RunnerTaskStore(d1 as any)
+
+    const questionIds = await store.getJobQuestionIds("job-1")
+
+    expect(questionIds).toEqual(["q1", "q2"])
+    expect(d1.prepared[0].sql).toContain("SELECT DISTINCT question_id")
+    expect(d1.prepared[0].bindings).toEqual(["job-1"])
+  })
+
+  test("progress increments do not copy retry-subset counts into run aggregates", async () => {
+    const d1 = new FakeD1()
+    const store = new RunnerTaskStore(d1 as any)
+
+    await store.incrementRunProgress("run-1", "search", "completed")
+
+    expect(
+      d1.prepared.some((statement) => statement.sql.includes("UPDATE runs"))
+    ).toBe(false)
+  })
+
+  test("run terminalization refreshes aggregate counts from questions", async () => {
+    const d1 = new FakeD1()
+    d1.allRows = [
+      [
+        {
+          phase_ingest: JSON.stringify({ status: "completed" }),
+          phase_indexing: JSON.stringify({ status: "completed" }),
+          phase_search: JSON.stringify({ status: "pending" }),
+          phase_evaluate: JSON.stringify({ status: "pending" }),
+        },
+        {
+          phase_ingest: JSON.stringify({ status: "completed" }),
+          phase_indexing: JSON.stringify({ status: "completed" }),
+          phase_search: JSON.stringify({ status: "completed" }),
+          phase_evaluate: JSON.stringify({ status: "completed", score: 1 }),
+        },
+      ],
+    ]
+    const store = new RunnerTaskStore(d1 as any)
+
+    await store.markRunTerminal("run-1", "execution-1", "interrupted", "Stopped")
+
+    const summaryUpdate = d1.prepared.find((statement) =>
+      statement.sql.includes("ingested_count = ?")
+    )
+    const terminalUpdate = d1.prepared.find((statement) =>
+      statement.sql.includes("active_execution_token = NULL")
+    )
+    expect(summaryUpdate?.bindings.slice(0, 7)).toEqual([2, 2, 2, 1, 1, 1, 1])
+    expect(terminalUpdate?.bindings[0]).toBe("interrupted")
+  })
+
+  test("enqueues retry phase tasks only for the requested question subset", async () => {
+    const d1 = new FakeD1()
+    const sentMessages: unknown[] = []
+    d1.allRows = [
+      [
+        { question_id: "q1", phase_status: JSON.stringify({ status: "pending" }) },
+        { question_id: "q2", phase_status: JSON.stringify({ status: "pending" }) },
+        { question_id: "q3", phase_status: JSON.stringify({ status: "pending" }) },
+      ],
+    ]
+    d1.firstRows = [{ id: "task-q1" }, { id: "task-q3" }]
+    const store = new RunnerTaskStore(d1 as any)
+
+    await enqueueRunPhaseTasks(
+      {
+        OBSERVATORY_DB: d1,
+        OBSERVATORY_RUNNER_QUEUE: {
+          send: async (message: unknown) => {
+            sentMessages.push(message)
+          },
+        },
+      } as any,
+      store,
+      {
+        jobId: "job-1",
+        runId: "run-1",
+        phase: "ingest",
+        questionIds: ["q1", "q3"],
+        retryCleanup: true,
+      }
+    )
+
+    const insertBindings = d1.prepared
+      .filter((statement) => statement.sql.includes("INSERT INTO runner_tasks"))
+      .map((statement) => statement.bindings)
+
+    expect(insertBindings).toHaveLength(2)
+    expect(insertBindings.map((bindings) => bindings[7])).toEqual(["q1", "q3"])
+    expect(insertBindings.map((bindings) => bindings[9])).toEqual([
+      JSON.stringify({ questionId: "q1", retryCleanup: true }),
+      JSON.stringify({ questionId: "q3", retryCleanup: true }),
+    ])
+    expect(sentMessages).toEqual([
+      { kind: "task.execute", taskId: "task-q1" },
+      { kind: "task.execute", taskId: "task-q3" },
+    ])
   })
 })

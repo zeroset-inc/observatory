@@ -3,7 +3,6 @@ import type { BenchmarkName } from "../types/benchmark"
 import type { PhaseId, SamplingConfig } from "../types/checkpoint"
 import type { ConcurrencyConfig } from "../types/concurrency"
 import type { CompareManifest } from "../orchestrator/batch"
-import type { RunnerTaskMessage } from "./tasks/types"
 
 export interface RunStartJob {
   kind: "run.start"
@@ -22,6 +21,15 @@ export interface RunStartJob {
   fromPhase?: PhaseId
 }
 
+export interface RunRetryQuestionsJob {
+  kind: "run.retry_questions"
+  jobId: string
+  executionToken: string
+  runId: string
+  questionIds: string[]
+  fromPhase: PhaseId
+}
+
 export interface CompareExecuteJob {
   kind: "compare.execute"
   jobId: string
@@ -30,5 +38,3 @@ export interface CompareExecuteJob {
   manifest: CompareManifest
   leaseToken: string
 }
-
-export type RunnerMessage = RunStartJob | CompareExecuteJob | RunnerTaskMessage

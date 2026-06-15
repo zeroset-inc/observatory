@@ -349,31 +349,9 @@ export class RunnerTaskStore {
              updated_at = ?
          WHERE run_id = ?
            AND phase = ?`
-      )
+    )
       .bind(nowIso(), runId, phase)
       .run()
-    if (field === "completed") {
-      const countColumn = {
-        ingest: "ingested_count",
-        indexing: "indexed_count",
-        search: "searched_count",
-        evaluate: "evaluated_count",
-      }[phase]
-      await this.db
-        .prepare(
-          `UPDATE runs
-           SET ${countColumn} = (
-                 SELECT completed
-                 FROM run_phase_progress
-                 WHERE run_id = ?
-                   AND phase = ?
-               ),
-               updated_at = ?
-           WHERE id = ?`
-        )
-        .bind(runId, phase, nowIso(), runId)
-        .run()
-    }
   }
 
   async refreshRunSummaryFromQuestions(runId: string): Promise<void> {
@@ -453,6 +431,20 @@ export class RunnerTaskStore {
       .bind(runId, phase)
       .first<{ total: number; completed: number; failed: number }>()
     return row ?? null
+  }
+
+  async getJobQuestionIds(jobId: string): Promise<string[]> {
+    const rows = await this.db
+      .prepare(
+        `SELECT DISTINCT question_id
+         FROM runner_tasks
+         WHERE job_id = ?
+           AND question_id IS NOT NULL
+         ORDER BY question_id`
+      )
+      .bind(jobId)
+      .all<{ question_id: string }>()
+    return (rows.results ?? []).map((row) => row.question_id)
   }
 
   async getRunnableTaskCount(runId: string): Promise<number> {
@@ -664,6 +656,7 @@ export class RunnerTaskStore {
     error?: string
   ): Promise<void> {
     const timestamp = nowIso()
+    await this.refreshRunSummaryFromQuestions(runId)
     await this.db
       .prepare(
         `UPDATE runs

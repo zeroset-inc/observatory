@@ -1,5 +1,6 @@
 import { getRuntimeEnv, type ObservatoryEnv } from "../server/runtime"
-import type { RunnerMessage, RunStartJob, CompareExecuteJob } from "./messages"
+import type { RunStartJob, RunRetryQuestionsJob, CompareExecuteJob } from "./messages"
+import type { RunnerTaskMessage } from "./tasks/types"
 
 type DurableCommandResult<T = unknown> = {
   ok: boolean
@@ -8,7 +9,7 @@ type DurableCommandResult<T = unknown> = {
 }
 
 function hasDurableRunner(env: ObservatoryEnv | null): env is ObservatoryEnv & {
-  OBSERVATORY_RUNNER_QUEUE: Queue<RunnerMessage>
+  OBSERVATORY_RUNNER_QUEUE: Queue<RunnerTaskMessage>
   RUN_COORDINATOR: DurableObjectNamespace
   COMPARE_COORDINATOR: DurableObjectNamespace
 } {
@@ -52,6 +53,16 @@ export async function requestRunStop(runId: string): Promise<DurableCommandResul
     return { ok: false, status: 503, data: { error: "Durable runner is not configured" } }
   }
   return sendCommand(env.RUN_COORDINATOR, runId, `/stop?id=${encodeURIComponent(runId)}`)
+}
+
+export async function retryRunQuestions(
+  job: Omit<RunRetryQuestionsJob, "jobId" | "executionToken">
+): Promise<DurableCommandResult> {
+  const env = getRuntimeEnv()
+  if (!hasDurableRunner(env)) {
+    return { ok: false, status: 503, data: { error: "Durable runner is not configured" } }
+  }
+  return sendCommand(env.RUN_COORDINATOR, job.runId, "/retry-questions", job)
 }
 
 export async function beginRunDelete(runId: string): Promise<DurableCommandResult> {
