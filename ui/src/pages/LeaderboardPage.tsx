@@ -12,7 +12,7 @@ import { Search, ChevronDown, ChevronRight } from "lucide-react"
 // Provider colors for charts — muted/desaturated palette
 const PROVIDER_COLORS: Record<string, string> = {
   supermemory: "#4d85c8",
-  nebula: "#4838cc",
+  nebula: "#5b5fd6",
 }
 const DEFAULT_COLORS = ["#32ab80", "#b35a40", "#c4a035", "#4d85c8", "#9a6acc"]
 

@@ -1,75 +1,94 @@
 import type { Config } from "tailwindcss"
 
+/**
+ * Observatory theme — aligned to the Zeroset brand layer.
+ *
+ * Every color token here is a thin alias for a CSS variable defined in
+ * src/index.css (space-separated rgb triplets). Adjust values in the CSS, not
+ * here. The semantic names (bg-*, text-*, accent, border-*) are kept stable so
+ * the rest of the app never needs to change when the palette is re-skinned.
+ *
+ * Shared with zeroset-inc/zeroset-site: indigo accent (#5B5FD6), the cool
+ * void/graphite/steel/bone neutral ramp, Satoshi (display/UI) + IBM Plex Mono,
+ * sharp 0-radius corners, and hairline borders over heavy glow.
+ */
 const config: Config = {
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
   theme: {
     extend: {
       colors: {
         bg: {
-          void: "#050507",
-          deep: "#08080a",
-          primary: "#0b0b0e",
-          surface: "#141418",
-          "surface-hover": "#1c1c22",
-          elevated: "#24242c",
+          void: "rgb(var(--bg-void) / <alpha-value>)",
+          deep: "rgb(var(--bg-deep) / <alpha-value>)",
+          primary: "rgb(var(--bg-primary) / <alpha-value>)",
+          surface: "rgb(var(--bg-surface) / <alpha-value>)",
+          "surface-hover": "rgb(var(--bg-surface-hover) / <alpha-value>)",
+          elevated: "rgb(var(--bg-elevated) / <alpha-value>)",
         },
         accent: {
-          DEFAULT: "#5040ff",
-          hover: "#7366ff",
-          muted: "rgba(80, 64, 255, 0.15)",
-          glow: "#968cff",
-          secondary: "#5040ff",
-          warm: "#f59e0b",
+          DEFAULT: "rgb(var(--accent) / <alpha-value>)",
+          hover: "rgb(var(--accent-hover) / <alpha-value>)",
+          muted: "rgb(var(--accent) / 0.15)",
+          glow: "rgb(var(--accent-glow) / <alpha-value>)",
+          secondary: "rgb(var(--accent-secondary) / <alpha-value>)",
+          deep: "rgb(var(--accent-deep) / <alpha-value>)",
         },
         text: {
-          primary: "#f0f0f5",
-          secondary: "#8888a0",
-          muted: "#55556a",
+          primary: "rgb(var(--text-primary) / <alpha-value>)",
+          secondary: "rgb(var(--text-secondary) / <alpha-value>)",
+          muted: "rgb(var(--text-muted) / <alpha-value>)",
         },
         border: {
-          DEFAULT: "#1e1e24",
-          hover: "#2a2a32",
-          accent: "rgba(80, 64, 255, 0.25)",
+          // Hairline borders: bone (fg-1) at low alpha, the way zeroset does it.
+          DEFAULT: "rgb(var(--text-primary) / 0.08)",
+          hover: "rgb(var(--text-primary) / 0.14)",
+          accent: "rgb(var(--accent) / 0.25)",
         },
         status: {
-          success: "#10b981",
-          error: "#f43f5e",
-          warning: "#f59e0b",
-          running: "#5040ff",
+          success: "rgb(var(--status-success) / <alpha-value>)",
+          error: "rgb(var(--status-error) / <alpha-value>)",
+          warning: "rgb(var(--status-warning) / <alpha-value>)",
+          running: "rgb(var(--accent) / <alpha-value>)",
         },
         nebula: {
-          50: "#eeedff",
-          100: "#dcd9ff",
-          200: "#b9b2ff",
-          300: "#968cff",
-          400: "#7366ff",
-          500: "#5040ff",
-          600: "#4033cc",
-          700: "#302699",
-          800: "#201a66",
-          900: "#100d33",
-          950: "#08061a",
+          50: "rgb(238 238 252 / <alpha-value>)",
+          100: "rgb(220 221 249 / <alpha-value>)",
+          200: "rgb(193 195 244 / <alpha-value>)",
+          300: "rgb(163 166 238 / <alpha-value>)",
+          400: "rgb(133 137 230 / <alpha-value>)",
+          500: "rgb(91 95 214 / <alpha-value>)",
+          600: "rgb(74 78 192 / <alpha-value>)",
+          700: "rgb(63 67 184 / <alpha-value>)",
+          800: "rgb(44 47 128 / <alpha-value>)",
+          900: "rgb(25 27 64 / <alpha-value>)",
+          950: "rgb(13 14 34 / <alpha-value>)",
         },
       },
       fontFamily: {
-        display: ["Plus Jakarta Sans", "system-ui", "sans-serif"],
-        body: ["IBM Plex Sans", "system-ui", "sans-serif"],
-        mono: ["IBM Plex Mono", "monospace"],
+        display: ["Satoshi", "system-ui", "sans-serif"],
+        body: ["Satoshi", "system-ui", "sans-serif"],
+        mono: ["IBM Plex Mono", "ui-monospace", "SF Mono", "Menlo", "monospace"],
       },
       borderRadius: {
-        sm: "4px",
-        DEFAULT: "8px",
-        md: "8px",
-        lg: "12px",
-        xl: "16px",
+        // Sharp-corner theme — rectangular surfaces carry no radius (matches
+        // zeroset-site). `rounded-full` is intentionally left at the Tailwind
+        // default for genuine circles (status dots, knobs, circular progress).
+        sm: "0",
+        DEFAULT: "0",
+        md: "0",
+        lg: "0",
+        xl: "0",
+        "2xl": "0",
+        "3xl": "0",
       },
       boxShadow: {
-        glow: "0 0 12px rgba(80, 64, 255, 0.08)",
-        "glow-lg": "0 0 24px rgba(80, 64, 255, 0.12)",
-        "glow-sm": "0 0 6px rgba(80, 64, 255, 0.06)",
-        glass: "0 8px 32px rgba(0, 0, 0, 0.4)",
-        "glass-sm": "0 4px 16px rgba(0, 0, 0, 0.3)",
-        float: "0 20px 60px rgba(0, 0, 0, 0.5)",
+        // Crisp 1px accent rings over soft halos — zeroset's restrained look.
+        glow: "0 0 0 1px rgba(91, 95, 214, 0.12)",
+        "glow-lg": "0 0 0 1px rgba(91, 95, 214, 0.18), 0 8px 32px rgba(91, 95, 214, 0.12)",
+        "glow-sm": "0 0 0 1px rgba(91, 95, 214, 0.08)",
+        glass: "0 8px 32px rgba(0, 0, 0, 0.5)",
+        "glass-sm": "0 4px 16px rgba(0, 0, 0, 0.4)",
+        float: "0 20px 60px rgba(0, 0, 0, 0.6)",
       },
       animation: {
         "fade-in": "fadeIn 0.4s ease-out",
@@ -108,8 +127,8 @@ const config: Config = {
           "100%": { backgroundPosition: "200% 0" },
         },
         glowPulse: {
-          "0%, 100%": { boxShadow: "0 0 8px rgba(80, 64, 255, 0.06)" },
-          "50%": { boxShadow: "0 0 14px rgba(80, 64, 255, 0.12)" },
+          "0%, 100%": { boxShadow: "0 0 0 1px rgba(91, 95, 214, 0.10)" },
+          "50%": { boxShadow: "0 0 0 1px rgba(91, 95, 214, 0.22)" },
         },
         float: {
           "0%, 100%": { transform: "translateY(0)" },

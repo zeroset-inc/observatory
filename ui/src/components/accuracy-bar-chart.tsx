@@ -1,7 +1,7 @@
 // Provider colors - supermemory gets blue, others get assigned colors
 const PROVIDER_COLORS: Record<string, string> = {
   supermemory: "#60a5fa",
-  nebula: "#5040ff",
+  nebula: "#5b5fd6",
 }
 
 const DEFAULT_COLORS = [

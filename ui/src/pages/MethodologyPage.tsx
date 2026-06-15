@@ -13,7 +13,7 @@ export default function MethodologyPage() {
           Every benchmark run, scoring decision, and latency measurement described here is
           implemented in{" "}
           <a
-            href="https://github.com/nebula-agi/observatory"
+            href="https://github.com/zeroset-inc/observatory"
             target="_blank"
             rel="noopener noreferrer"
             className="text-accent hover:underline"
@@ -34,12 +34,12 @@ export default function MethodologyPage() {
             <p className="text-text-secondary leading-relaxed">
               Cognitive-based benchmarking for agentic memory systems from{" "}
               <a
-                href="https://github.com/nebula-agi/atlas"
+                href="https://github.com/zeroset-inc/atlas"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-accent hover:underline"
               >
-                Nebula Research
+                Zeroset Research
               </a>
               . Evaluates six cognitive pillars — world modeling, declarative reasoning,
               temporal-episodic recall, preference learning, knowledge boundaries, and
@@ -195,7 +195,7 @@ export default function MethodologyPage() {
           Observatory is open to all memory system providers.
         </p>
         <a
-          href="https://github.com/nebula-agi/observatory"
+          href="https://github.com/zeroset-inc/observatory"
           target="_blank"
           rel="noopener noreferrer"
           className="inline-flex items-center gap-2 px-5 py-2.5 bg-accent text-white text-sm font-medium rounded-lg hover:bg-accent/90 transition-colors"
