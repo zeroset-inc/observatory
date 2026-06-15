@@ -6,6 +6,8 @@ import type { ICheckpointManager } from "../checkpoint"
 import { logger } from "../../utils/logger"
 import { ConcurrentExecutor } from "../concurrent"
 import { resolveConcurrency } from "../../types/concurrency"
+import type { TaskExecutionGuard } from "../taskGuard"
+import { assertTaskActive, ensureTaskActive, isTaskCancelledError } from "../taskGuard"
 
 /**
  * Search a single question against the provider.
@@ -16,7 +18,9 @@ export async function searchQuestion(
   question: UnifiedQuestion,
   checkpoint: RunCheckpoint,
   checkpointManager: ICheckpointManager,
+  guard?: TaskExecutionGuard,
 ): Promise<{ questionId: string; durationMs: number } | null> {
+  assertTaskActive(guard)
   const { questionId } = question
   const searchStatus = checkpointManager.getPhaseStatus(checkpoint, questionId, "search")
   const indexingStatus = checkpointManager.getPhaseStatus(checkpoint, questionId, "indexing")
@@ -25,6 +29,7 @@ export async function searchQuestion(
   const containerTag = `${questionId}-${checkpoint.dataSourceRunId}`
 
   const startTime = Date.now()
+  assertTaskActive(guard)
   checkpointManager.updatePhase(checkpoint, questionId, "search", {
     status: "in_progress",
     startedAt: new Date().toISOString(),
@@ -37,11 +42,13 @@ export async function searchQuestion(
       threshold: 0.3,
       ...(checkpoint.searchEffort && { effort: checkpoint.searchEffort }),
     })
+    await ensureTaskActive(guard)
 
     const durationMs = Date.now() - startTime
 
-    const { supabase } = require("../../server/db/supabase")
-    await supabase.from("search_results").upsert(
+    const { db } = require("../../server/db")
+    await ensureTaskActive(guard)
+    await db.from("search_results").upsert(
       {
         run_id: checkpoint.runId,
         question_id: questionId,
@@ -57,6 +64,7 @@ export async function searchQuestion(
       { onConflict: "run_id,question_id" }
     )
 
+    await ensureTaskActive(guard)
     checkpointManager.updatePhase(checkpoint, questionId, "search", {
       status: "completed",
       results,
@@ -66,6 +74,7 @@ export async function searchQuestion(
 
     return { questionId, durationMs }
   } catch (e) {
+    if (isTaskCancelledError(e)) throw e
     const error = e instanceof Error ? e.message : String(e)
     checkpointManager.updatePhase(checkpoint, questionId, "search", {
       status: "failed",

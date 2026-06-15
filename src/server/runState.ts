@@ -18,28 +18,67 @@ export const activeRuns = new Map<string, RunState>()
 
 // Reference counter for concurrent retry sessions per run
 const retryRefCount = new Map<string, number>()
+const durableStopSignals = new Set<string>()
 
 // Check if a run should stop (sync — reads Map only)
 export function shouldStop(runId: string): boolean {
+  if (durableStopSignals.has(runId)) return true
   const state = activeRuns.get(runId)
   return state?.status === "stopping"
+}
+
+export function startDurableStopPolling(runId: string, intervalMs = 1000): () => void {
+  let stopped = false
+  let polling = false
+
+  const poll = async () => {
+    if (stopped || polling) return
+    polling = true
+    try {
+      const { db } = require("./db")
+      const { data, error } = await db
+        .from("runs")
+        .select("active_status")
+        .eq("id", runId)
+        .maybeSingle()
+
+      if (!error && data?.active_status === "stopping") {
+        durableStopSignals.add(runId)
+        const state = activeRuns.get(runId)
+        if (state) state.status = "stopping"
+      }
+    } catch {
+      // Stop polling is best-effort between phase boundaries; failures are retried.
+    } finally {
+      polling = false
+    }
+  }
+
+  void poll()
+  const timer = setInterval(() => void poll(), intervalMs)
+  return () => {
+    stopped = true
+    clearInterval(timer)
+    durableStopSignals.delete(runId)
+  }
 }
 
 // Mark a run as stopping (write-through)
 export function requestStop(runId: string): boolean {
   const state = activeRuns.get(runId)
-  if (!state) return false
-  state.status = "stopping"
+  durableStopSignals.add(runId)
+  if (state) state.status = "stopping"
 
   // Write-through to DB (fire-and-forget)
-  const { supabase } = require("./db/supabase")
-  supabase.from("runs").update({ active_status: "stopping" }).eq("id", runId).then()
+  const { db } = require("./db")
+  db.from("runs").update({ active_status: "stopping" }).eq("id", runId).then()
 
-  return true
+  return Boolean(state)
 }
 
 // Start tracking a run (write-through)
 export function startRun(runId: string, benchmark?: string, userId?: string | null): void {
+  durableStopSignals.delete(runId)
   activeRuns.set(runId, {
     status: "running",
     startedAt: new Date().toISOString(),
@@ -48,8 +87,8 @@ export function startRun(runId: string, benchmark?: string, userId?: string | nu
   })
 
   // Write-through to DB (fire-and-forget)
-  const { supabase } = require("./db/supabase")
-  supabase.from("runs").update({ active_status: "running" }).eq("id", runId).then()
+  const { db } = require("./db")
+  db.from("runs").update({ active_status: "running" }).eq("id", runId).then()
 }
 
 // Atomically start a run only if it's not already active.
@@ -98,10 +137,11 @@ export function getRetrySlotCount(runId: string): number {
 // Stop tracking a run (write-through)
 export function endRun(runId: string): void {
   activeRuns.delete(runId)
+  durableStopSignals.delete(runId)
 
   // Write-through to DB (fire-and-forget)
-  const { supabase } = require("./db/supabase")
-  supabase.from("runs").update({ active_status: null }).eq("id", runId).then()
+  const { db } = require("./db")
+  db.from("runs").update({ active_status: null }).eq("id", runId).then()
 }
 
 // Attach a completion promise to a tracked run.
@@ -165,10 +205,10 @@ export function getActiveRunsWithBenchmarks(): Array<{ runId: string; benchmark:
  * Runs that were "running" or "stopping" when the server crashed are now dead.
  */
 export async function recoverStaledRuns(): Promise<void> {
-  const { supabase } = require("./db/supabase")
+  const { db } = require("./db")
 
   // Recover runs that were actively running/stopping when the server crashed
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("runs")
     .update({ active_status: null, status: "failed" })
     .not("active_status", "is", null)
@@ -185,7 +225,7 @@ export async function recoverStaledRuns(): Promise<void> {
   // Recover runs stuck in "initializing" that never started (active_status is null)
   // These are runs where the server died between DB insert and startRun()
   const staleThreshold = new Date(Date.now() - 5 * 60 * 1000).toISOString() // 5 minutes
-  const { data: staleInit, error: staleErr } = await supabase
+  const { data: staleInit, error: staleErr } = await db
     .from("runs")
     .update({ status: "failed" })
     .eq("status", "initializing")

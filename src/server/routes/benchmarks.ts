@@ -4,6 +4,7 @@ import { getAvailableProviders, getProviderInfo } from "../../providers"
 import { getAvailableBenchmarks, createBenchmark } from "../../benchmarks"
 import { MODEL_ALIASES, listModelsByProvider } from "../../utils/models"
 import { getActiveRunsWithBenchmarks } from "../runState"
+import { isWorkerRuntime } from "../runtime"
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -38,6 +39,10 @@ export async function handleBenchmarksRoutes(req: Request, url: URL): Promise<Re
 
   // GET /api/downloads - Check for active downloads by observing filesystem
   if (method === "GET" && pathname === "/api/downloads") {
+    if (isWorkerRuntime()) {
+      return json({ hasActive: false, downloads: [] })
+    }
+
     const benchmarkDatasets: Record<string, { path: string; displayName: string }> = {
       longmemeval: {
         path: "./data/benchmarks/longmemeval/datasets/longmemeval_s_cleaned.json",

@@ -1,7 +1,11 @@
-export const ALLOWED_ORIGINS = (process.env.OBSERVATORY_ALLOWED_ORIGINS || "http://localhost:3003")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean)
+import { getEnvValue } from "./runtime"
+
+function getAllowedOrigins(): string[] {
+  return (getEnvValue("OBSERVATORY_ALLOWED_ORIGINS") || "http://localhost:3003")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+}
 
 const PREFLIGHT_CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
@@ -11,7 +15,7 @@ const PREFLIGHT_CORS_HEADERS = {
 } as const
 
 export function isAllowedOrigin(origin: string | null): origin is string {
-  return Boolean(origin && ALLOWED_ORIGINS.includes(origin))
+  return Boolean(origin && getAllowedOrigins().includes(origin))
 }
 
 function appendVaryHeader(headers: Headers, value: string): void {

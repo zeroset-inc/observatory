@@ -51,8 +51,13 @@ class Logger {
   progress(current: number, total: number, message: string) {
     const percent = Math.round((current / total) * 100)
     const bar = "█".repeat(Math.floor(percent / 5)) + "░".repeat(20 - Math.floor(percent / 5))
-    process.stdout.write(`\r${COLORS.info}[${bar}]${COLORS.reset} ${percent}% ${message}`)
-    if (current === total) console.log()
+    const stdout = (globalThis as any).process?.stdout
+    if (typeof stdout?.write === "function") {
+      stdout.write(`\r${COLORS.info}[${bar}]${COLORS.reset} ${percent}% ${message}`)
+      if (current === total) console.log()
+      return
+    }
+    this.info(`${percent}% ${message}`)
   }
 }
 

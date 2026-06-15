@@ -15,13 +15,13 @@ describe("extractSetCookie", () => {
 
         return [
           "other_cookie=one; Path=/; Max-Age=600",
-          "nebula_session=nebula%20session; Path=/; HttpOnly; Max-Age=60",
+          "observatory_session=observatory%20session; Path=/; HttpOnly; Max-Age=60",
         ].join(", ")
       },
     } as unknown as Headers
 
-    expect(extractSetCookie(headers, "nebula_session")).toEqual({
-      value: "nebula session",
+    expect(extractSetCookie(headers, "observatory_session")).toEqual({
+      value: "observatory session",
       maxAge: 60,
     })
   })
@@ -32,13 +32,13 @@ describe("extractSetCookie", () => {
         if (name.toLowerCase() !== "set-cookie") return null
 
         return [
-          "nebula_session=%zz; Path=/; HttpOnly; Max-Age=60",
-          "nebula_session=valid%20session; Path=/; HttpOnly; Max-Age=120",
+          "observatory_session=%zz; Path=/; HttpOnly; Max-Age=60",
+          "observatory_session=valid%20session; Path=/; HttpOnly; Max-Age=120",
         ].join(", ")
       },
     } as unknown as Headers
 
-    expect(extractSetCookie(headers, "nebula_session")).toEqual({
+    expect(extractSetCookie(headers, "observatory_session")).toEqual({
       value: "valid session",
       maxAge: 120,
     })

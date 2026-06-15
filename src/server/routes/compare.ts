@@ -1,17 +1,25 @@
 import type { ICheckpointManager } from "../../orchestrator/checkpoint"
-import { SupabaseCheckpointManager } from "../../orchestrator/supabaseCheckpoint"
+import { D1CheckpointManager } from "../../orchestrator/d1Checkpoint"
 import { batchManager } from "../../orchestrator/batch"
 import type { CompareManifest } from "../../orchestrator/batch"
-import { wsManager } from "../index"
-import { getRunState } from "../runState"
-import { optionalAuth } from "../middleware/auth"
+import { wsManager } from "../wsManager"
+import { getRunState, requestStop as requestRunStop } from "../runState"
+import { optionalAuth, AuthError } from "../middleware/auth"
+import { fetchAllUserKeys } from "../services/apiKeys"
 import type { ProviderName } from "../../types/provider"
 import type { BenchmarkName } from "../../types/benchmark"
 import type { SamplingConfig } from "../../types/checkpoint"
+import type { BackgroundExecutionContext } from "../http"
+import {
+  deleteComparison as deleteDurableComparison,
+  durableRunnerAvailable,
+  enqueueCompareExecution,
+  requestCompareStop as requestDurableCompareStop,
+} from "../../runner/client"
 
 function getCheckpointManager(): ICheckpointManager {
-  const { supabase } = require("../db/supabase")
-  return new SupabaseCheckpointManager(supabase)
+  const { db } = require("../db")
+  return new D1CheckpointManager(db)
 }
 
 // Track active comparisons in memory (similar to runState.ts)
@@ -20,6 +28,7 @@ export type CompareState = {
   startedAt: string
   benchmark?: string
   runIds: string[]
+  leaseToken: string
 }
 
 const activeCompares = new Map<string, CompareState>()
@@ -31,24 +40,25 @@ function json(data: unknown, status = 200): Response {
   })
 }
 
-function shouldStop(compareId: string): boolean {
-  const state = activeCompares.get(compareId)
-  return state?.status === "stopping"
-}
-
-function requestStop(compareId: string): boolean {
+function requestCompareStop(compareId: string): boolean {
   const state = activeCompares.get(compareId)
   if (!state) return false
   state.status = "stopping"
   return true
 }
 
-function startCompare(compareId: string, benchmark: string, runIds: string[]): void {
+function startCompare(
+  compareId: string,
+  benchmark: string,
+  runIds: string[],
+  leaseToken: string
+): void {
   activeCompares.set(compareId, {
     status: "running",
     startedAt: new Date().toISOString(),
     benchmark,
     runIds,
+    leaseToken,
   })
 }
 
@@ -64,14 +74,56 @@ function getCompareState(compareId: string): CompareState | undefined {
   return activeCompares.get(compareId)
 }
 
-export async function handleCompareRoutes(req: Request, url: URL): Promise<Response | null> {
+function isLeaseActive(expiresAt?: string | null): boolean {
+  if (!expiresAt) return false
+  return new Date(expiresAt).getTime() > Date.now()
+}
+
+function getPersistedCompareState(manifest: CompareManifest): "running" | "stopping" | undefined {
+  if (manifest.activeStatus === "stopping" && isLeaseActive(manifest.activeLeaseExpiresAt)) {
+    return "stopping"
+  }
+  if (manifest.activeStatus === "running" && isLeaseActive(manifest.activeLeaseExpiresAt)) {
+    return "running"
+  }
+  return undefined
+}
+
+function isPersistedCompareActive(manifest: CompareManifest): boolean {
+  return batchManager.isComparisonManifestActive(manifest)
+}
+
+function getEffectiveCompareState(manifest: CompareManifest): "running" | "stopping" | undefined {
+  return getPersistedCompareState(manifest) ?? getCompareState(manifest.compareId)?.status
+}
+
+async function verifyCompareOwnership(
+  compareId: string,
+  user: import("../middleware/auth").AuthUser | null
+): Promise<{ manifest: CompareManifest } | Response> {
+  if (!user) return json({ error: "Authentication required" }, 401)
+  const manifest = await batchManager.loadManifestAsync(compareId)
+  if (!manifest) return json({ error: "Comparison not found" }, 404)
+  if (manifest.userId !== user.id) return json({ error: "Forbidden" }, 403)
+  return { manifest }
+}
+
+export async function handleCompareRoutes(
+  req: Request,
+  url: URL,
+  executionContext?: BackgroundExecutionContext
+): Promise<Response | null> {
   const method = req.method
   const pathname = url.pathname
   const checkpointManager = getCheckpointManager()
 
   // GET /api/compare - List all comparisons
   if (method === "GET" && pathname === "/api/compare") {
-    const manifests = await batchManager.listComparisons()
+    const user = await optionalAuth(req)
+    if (!user) return json({ error: "Authentication required" }, 401)
+    const manifests = (await batchManager.listComparisons()).filter(
+      (manifest) => manifest.userId === user.id
+    )
 
     const compareDetails = await Promise.all(
       manifests.map(async (manifest) => {
@@ -102,12 +154,12 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
         const allCompleted = runProgress.every((r) => r.status === "completed")
         const anyFailed = runProgress.some((r) => r.status === "failed")
         const anyRunning = runProgress.some((r) => r.status === "running")
-        const compareState = getCompareState(manifest.compareId)
+        const compareState = getEffectiveCompareState(manifest)
 
         let overallStatus: string
-        if (compareState?.status === "stopping") {
+        if (compareState === "stopping") {
           overallStatus = "stopping"
-        } else if (compareState?.status === "running" || anyRunning) {
+        } else if (compareState === "running" || anyRunning) {
           overallStatus = "running"
         } else if (anyFailed) {
           overallStatus = "failed"
@@ -137,7 +189,10 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
   // POST /api/compare/start - Start new comparison
   if (method === "POST" && pathname === "/api/compare/start") {
     try {
-      const body = await req.json()
+      const user = await optionalAuth(req)
+      if (!user) return json({ error: "Authentication required" }, 401)
+      const userKeys = await fetchAllUserKeys(user.id)
+      const body = (await req.json()) as Record<string, any>
       const { providers, benchmark, judgeModel, sampling, force } = body
 
       if (!providers || !Array.isArray(providers) || providers.length === 0) {
@@ -155,12 +210,16 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
         providers: providers as ProviderName[],
         benchmark: benchmark as BenchmarkName,
         judgeModel,
+        userId: user.id,
+        userKeys,
+        executionContext,
         sampling,
         force,
       })
 
       return json({ message: "Comparison started", compareId })
     } catch (e) {
+      if (e instanceof AuthError) return json({ error: e.message }, e.status)
       return json({ error: e instanceof Error ? e.message : "Invalid request body" }, 400)
     }
   }
@@ -169,10 +228,10 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
   const compareIdMatch = pathname.match(/^\/api\/compare\/([^/]+)$/)
   if (method === "GET" && compareIdMatch) {
     const compareId = decodeURIComponent(compareIdMatch[1])
-    const manifest = await batchManager.loadManifestAsync(compareId)
-    if (!manifest) {
-      return json({ error: "Comparison not found" }, 404)
-    }
+    const user = await optionalAuth(req)
+    const ownership = await verifyCompareOwnership(compareId, user)
+    if (ownership instanceof Response) return ownership
+    const { manifest } = ownership
 
     // Get detailed progress for each run
     const runDetails = await Promise.all(
@@ -212,15 +271,15 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
     )
 
     // Calculate overall status - must match list endpoint logic exactly
-    const compareState = getCompareState(compareId)
+    const compareState = getEffectiveCompareState(manifest)
     const allCompleted = runDetails.every((r) => r.status === "completed")
     const anyFailed = runDetails.some((r) => r.status === "failed")
     const anyRunning = runDetails.some((r) => r.status === "running")
 
     let overallStatus: string
-    if (compareState?.status === "stopping") {
+    if (compareState === "stopping") {
       overallStatus = "stopping"
-    } else if (compareState?.status === "running" || anyRunning) {
+    } else if (compareState === "running" || anyRunning) {
       overallStatus = "running"
     } else if (anyFailed) {
       overallStatus = "failed"
@@ -242,10 +301,10 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
   const reportMatch = pathname.match(/^\/api\/compare\/([^/]+)\/report$/)
   if (method === "GET" && reportMatch) {
     const compareId = decodeURIComponent(reportMatch[1])
-    const manifest = await batchManager.loadManifestAsync(compareId)
-    if (!manifest) {
-      return json({ error: "Comparison not found" }, 404)
-    }
+    const user = await optionalAuth(req)
+    const ownership = await verifyCompareOwnership(compareId, user)
+    if (ownership instanceof Response) return ownership
+    const { manifest } = ownership
 
     const reports = await batchManager.getReports(manifest)
     if (reports.length === 0) {
@@ -268,13 +327,31 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
   const stopMatch = pathname.match(/^\/api\/compare\/([^/]+)\/stop$/)
   if (method === "POST" && stopMatch) {
     const compareId = decodeURIComponent(stopMatch[1])
-    if (!isCompareActive(compareId)) {
-      return json({ error: "Comparison is not active" }, 404)
+    const user = await optionalAuth(req)
+    const ownership = await verifyCompareOwnership(compareId, user)
+    if (ownership instanceof Response) return ownership
+    const { manifest } = ownership
+
+    if (durableRunnerAvailable()) {
+      const result = await requestDurableCompareStop(compareId)
+      if (!result.ok) return json(result.data, result.status)
+
+      wsManager.broadcast({
+        type: "compare_stopping",
+        compareId,
+      })
+
+      return json(result.data, result.status)
     }
 
-    const success = requestStop(compareId)
-    if (!success) {
-      return json({ error: "Failed to request stop" }, 500)
+    const compareStopRequested = requestCompareStop(compareId)
+    const stoppedRunIds = manifest.runs
+      .filter((run) => requestRunStop(run.runId))
+      .map((run) => run.runId)
+    const persistedStopRequested = await batchManager.requestComparisonStop(compareId)
+
+    if (!compareStopRequested && stoppedRunIds.length === 0 && !persistedStopRequested) {
+      return json({ error: "Comparison is not active" }, 404)
     }
 
     // Broadcast stop event
@@ -283,39 +360,96 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
       compareId,
     })
 
-    return json({ message: "Stop requested for comparison", compareId })
+    return json({ message: "Stop requested for comparison", compareId, stoppedRunIds })
   }
 
   // POST /api/compare/:compareId/resume - Resume comparison
   const resumeMatch = pathname.match(/^\/api\/compare\/([^/]+)\/resume$/)
   if (method === "POST" && resumeMatch) {
     const compareId = decodeURIComponent(resumeMatch[1])
+    try {
+      const user = await optionalAuth(req)
+      const ownership = await verifyCompareOwnership(compareId, user)
+      if (ownership instanceof Response) return ownership
+      const { manifest } = ownership
 
-    if (isCompareActive(compareId)) {
-      return json({ error: "Comparison is already active" }, 409)
+      if (durableRunnerAvailable()) {
+        const result = await enqueueCompareExecution({
+          kind: "compare.execute",
+          compareId,
+          manifest,
+        })
+        if (!result.ok) return json(result.data, result.status)
+
+        wsManager.broadcast({
+          type: "compare_resumed",
+          compareId,
+        })
+
+        return json({ message: "Comparison resumed", compareId })
+      }
+
+      if (isCompareActive(compareId)) {
+        return json({ error: "Comparison is already active" }, 409)
+      }
+
+      const userKeys = manifest.userId ? await fetchAllUserKeys(manifest.userId) : undefined
+
+      if (isCompareActive(compareId)) {
+        return json({ error: "Comparison is already active" }, 409)
+      }
+      const leaseToken = await batchManager.acquireComparisonLease(compareId)
+      if (!leaseToken) {
+        return json({ error: "Comparison is already active" }, 409)
+      }
+
+      startCompare(
+        compareId,
+        manifest.benchmark,
+        manifest.runs.map((r) => r.runId),
+        leaseToken
+      )
+
+      wsManager.broadcast({
+        type: "compare_resumed",
+        compareId,
+      })
+
+      const completion = executeResumedComparison(manifest, leaseToken, userKeys)
+      executionContext?.waitUntil(completion)
+
+      return json({ message: "Comparison resumed", compareId })
+    } catch (e) {
+      if (e instanceof AuthError) return json({ error: e.message }, e.status)
+      return json({ error: e instanceof Error ? e.message : "Failed to resume comparison" }, 500)
     }
-
-    const manifest = await batchManager.loadManifestAsync(compareId)
-    if (!manifest) {
-      return json({ error: "Comparison not found" }, 404)
-    }
-
-    // Resume the comparison
-    resumeComparison(compareId)
-
-    return json({ message: "Comparison resumed", compareId })
   }
 
   // DELETE /api/compare/:compareId - Delete comparison
   const deleteMatch = pathname.match(/^\/api\/compare\/([^/]+)$/)
   if (method === "DELETE" && deleteMatch) {
     const compareId = decodeURIComponent(deleteMatch[1])
+    const user = await optionalAuth(req)
+    const ownership = await verifyCompareOwnership(compareId, user)
+    if (ownership instanceof Response) return ownership
 
-    if (isCompareActive(compareId)) {
+    if (durableRunnerAvailable()) {
+      const result = await deleteDurableComparison(compareId)
+      return json(result.data, result.status)
+    }
+
+    if (isCompareActive(compareId) || isPersistedCompareActive(ownership.manifest)) {
       return json({ error: "Cannot delete active comparison" }, 409)
     }
 
-    await batchManager.delete(compareId)
+    try {
+      await batchManager.delete(compareId)
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("Cannot delete active comparison")) {
+        return json({ error: "Cannot delete active comparison" }, 409)
+      }
+      throw error
+    }
     return json({ message: "Comparison deleted", compareId })
   }
 
@@ -323,6 +457,13 @@ export async function handleCompareRoutes(req: Request, url: URL): Promise<Respo
 }
 
 function getRunStatus(checkpoint: any, summary: any): string {
+  if (
+    (checkpoint.activeStatus === "running" || checkpoint.activeStatus === "stopping") &&
+    isActiveLeaseCurrent(checkpoint.activeLeaseExpiresAt)
+  ) {
+    return checkpoint.activeStatus
+  }
+
   // Active process takes priority
   const runState = getRunState(checkpoint.runId)
   if (runState) {
@@ -372,10 +513,18 @@ function getRunStatus(checkpoint: any, summary: any): string {
   return "partial"
 }
 
+function isActiveLeaseCurrent(expiresAt?: string | null): boolean {
+  if (!expiresAt) return true
+  return new Date(expiresAt).getTime() > Date.now()
+}
+
 async function initializeComparison(options: {
   providers: ProviderName[]
   benchmark: BenchmarkName
   judgeModel: string
+  userId: string
+  userKeys?: Record<string, string>
+  executionContext?: BackgroundExecutionContext
   sampling?: SamplingConfig
   force?: boolean
 }): Promise<{ compareId: string }> {
@@ -383,10 +532,36 @@ async function initializeComparison(options: {
   const manifest = await batchManager.createManifest(options)
   const compareId = manifest.compareId
 
+  if (durableRunnerAvailable()) {
+    const result = await enqueueCompareExecution({
+      kind: "compare.execute",
+      compareId,
+      manifest,
+    })
+    if (!result.ok) {
+      throw new Error((result.data as any)?.error || "Failed to enqueue comparison")
+    }
+
+    wsManager.broadcast({
+      type: "compare_started",
+      compareId,
+      benchmark: options.benchmark,
+      providers: options.providers,
+    })
+
+    return { compareId }
+  }
+
+  const leaseToken = await batchManager.acquireComparisonLease(compareId)
+  if (!leaseToken) {
+    throw new Error(`Comparison is already active: ${compareId}`)
+  }
+
   startCompare(
     compareId,
     options.benchmark,
-    manifest.runs.map((r) => r.runId)
+    manifest.runs.map((r) => r.runId),
+    leaseToken
   )
 
   wsManager.broadcast({
@@ -397,8 +572,8 @@ async function initializeComparison(options: {
   })
 
   // Run execution in background - don't await
-  batchManager
-    .executeRuns(manifest)
+  const completion = batchManager
+    .executeRuns(manifest, options.userKeys, leaseToken)
     .then(() => {
       wsManager.broadcast({
         type: "compare_complete",
@@ -412,32 +587,23 @@ async function initializeComparison(options: {
         message: error instanceof Error ? error.message : "Unknown error",
       })
     })
-    .finally(() => {
+    .finally(async () => {
       endCompare(compareId)
+      await batchManager.releaseComparisonLease(compareId, leaseToken)
     })
+  options.executionContext?.waitUntil(completion)
 
   return { compareId }
 }
 
-async function resumeComparison(compareId: string) {
+async function executeResumedComparison(
+  manifest: CompareManifest,
+  leaseToken: string,
+  userKeys?: Record<string, string>
+) {
+  const compareId = manifest.compareId
   try {
-    const manifest = await batchManager.loadManifestAsync(compareId)
-    if (!manifest) {
-      throw new Error(`Comparison not found: ${compareId}`)
-    }
-
-    startCompare(
-      compareId,
-      manifest.benchmark,
-      manifest.runs.map((r) => r.runId)
-    )
-
-    wsManager.broadcast({
-      type: "compare_resumed",
-      compareId,
-    })
-
-    await batchManager.resume(compareId)
+    await batchManager.executeRuns(manifest, userKeys, leaseToken)
 
     wsManager.broadcast({
       type: "compare_complete",
@@ -452,5 +618,6 @@ async function resumeComparison(compareId: string) {
     })
   } finally {
     endCompare(compareId)
+    await batchManager.releaseComparisonLease(compareId, leaseToken)
   }
 }

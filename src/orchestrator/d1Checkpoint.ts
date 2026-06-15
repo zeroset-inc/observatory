@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js"
+import type { D1Client } from "../server/db"
 import type {
   RunCheckpoint,
   QuestionCheckpoint,
@@ -13,24 +13,30 @@ import { PHASE_ORDER } from "../types/checkpoint"
 import type { ICheckpointManager } from "./checkpoint"
 import { logger } from "../utils/logger"
 
+type D1CheckpointManagerOptions = {
+  skipRunRecount?: boolean
+}
+
 /**
- * SupabaseCheckpointManager — persists runs and questions to Supabase Postgres.
+ * D1CheckpointManager — persists runs and questions to Cloudflare D1.
  *
  * The in-memory RunCheckpoint object is the working copy
  * during a run. `save()` is fire-and-forget — it queues a DB write. Phases read/write
  * the in-memory checkpoint, and `save()` flushes the current state to DB.
  */
-export class SupabaseCheckpointManager implements ICheckpointManager {
-  private supabase: SupabaseClient
+export class D1CheckpointManager implements ICheckpointManager {
+  private db: D1Client
   private saveLock = new Map<string, Promise<void>>()
   private dirtyQuestions = new Map<string, Set<string>>() // runId -> dirty questionIds
+  private skipRunRecount: boolean
 
-  constructor(supabase: SupabaseClient) {
-    this.supabase = supabase
+  constructor(db: D1Client, options?: D1CheckpointManagerOptions) {
+    this.db = db
+    this.skipRunRecount = options?.skipRunRecount === true
   }
 
   async exists(runId: string): Promise<boolean> {
-    const { data, error } = await this.supabase
+    const { data, error } = await this.db
       .from("runs")
       .select("id")
       .eq("id", runId)
@@ -41,7 +47,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
 
   async load(runId: string): Promise<RunCheckpoint | null> {
     // Load run
-    const { data: run, error: runError } = await this.supabase
+    const { data: run, error: runError } = await this.db
       .from("runs")
       .select("*")
       .eq("id", runId)
@@ -50,7 +56,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
     if (runError || !run) return null
 
     // Load questions
-    const { data: questions, error: qError } = await this.supabase
+    const { data: questions, error: qError } = await this.db
       .from("questions")
       .select("*")
       .eq("run_id", runId)
@@ -60,9 +66,36 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
       return null
     }
 
-    // Reconstruct RunCheckpoint
+    return this.buildCheckpoint(run, questions || [])
+  }
+
+  async loadQuestion(runId: string, questionId: string): Promise<RunCheckpoint | null> {
+    const { data: run, error: runError } = await this.db
+      .from("runs")
+      .select("*")
+      .eq("id", runId)
+      .single()
+
+    if (runError || !run) return null
+
+    const { data: question, error: qError } = await this.db
+      .from("questions")
+      .select("*")
+      .eq("run_id", runId)
+      .eq("question_id", questionId)
+      .single()
+
+    if (qError || !question) {
+      logger.warn(`Failed to load question ${questionId} for run ${runId}: ${qError?.message || "not found"}`)
+      return null
+    }
+
+    return this.buildCheckpoint(run, [question])
+  }
+
+  private buildCheckpoint(run: any, questions: any[]): RunCheckpoint {
     const questionsMap: Record<string, QuestionCheckpoint> = {}
-    for (const q of questions || []) {
+    for (const q of questions) {
       questionsMap[q.question_id] = {
         questionId: q.question_id,
         containerTag: q.container_tag,
@@ -85,6 +118,8 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
       dataSourceRunId: run.data_source_run_id || run.id,
       userId: run.user_id || null,
       status: run.status as RunStatus,
+      activeStatus: run.active_status || null,
+      activeLeaseExpiresAt: run.active_lease_expires_at || null,
       provider: run.provider,
       benchmark: run.benchmark,
       judge: run.judge,
@@ -151,7 +186,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
       })
 
     if (questionRows.length > 0) {
-      const { error: qError } = await this.supabase
+      const { error: qError } = await this.db
         .from("questions")
         .upsert(questionRows, { onConflict: "run_id,question_id" })
 
@@ -160,10 +195,34 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
       }
     }
 
+    if (this.skipRunRecount) {
+      const { error: runError } = await this.db.from("runs").upsert({
+        id: checkpoint.runId,
+        slug: checkpoint.runId,
+        user_id: checkpoint.userId || null,
+        data_source_run_id: checkpoint.dataSourceRunId,
+        status: checkpoint.status,
+        provider: checkpoint.provider,
+        benchmark: checkpoint.benchmark,
+        judge: checkpoint.judge,
+        limit: checkpoint.limit,
+        sampling: checkpoint.sampling,
+        target_question_ids: checkpoint.targetQuestionIds,
+        concurrency: checkpoint.concurrency,
+        search_effort: checkpoint.searchEffort,
+        updated_at: checkpoint.updatedAt,
+      })
+
+      if (runError) {
+        logger.warn(`Failed to save run ${checkpoint.runId}: ${runError.message}`)
+      }
+      return
+    }
+
     // Compute summary counts from DB (not the in-memory checkpoint) so that
     // concurrent retries with separate checkpoint objects don't overwrite
     // each other's progress with stale counts.
-    const { data: dbQuestions, error: countError } = await this.supabase
+    const { data: dbQuestions, error: countError } = await this.db
       .from("questions")
       .select("phase_ingest, phase_indexing, phase_search, phase_evaluate")
       .eq("run_id", checkpoint.runId)
@@ -202,7 +261,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
     const accuracy = evaluatedCount > 0 ? correctCount / evaluatedCount : null
 
     // Upsert run row with DB-derived counts
-    const { error: runError } = await this.supabase.from("runs").upsert({
+    const { error: runError } = await this.db.from("runs").upsert({
       id: checkpoint.runId,
       slug: checkpoint.runId,
       user_id: checkpoint.userId || null,
@@ -274,7 +333,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
     }
 
     // Insert run row directly
-    const { error } = await this.supabase.from("runs").insert({
+    const { error } = await this.db.from("runs").insert({
       id: runId,
       slug: runId,
       user_id: options?.userId || null,
@@ -302,7 +361,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
 
   async delete(runId: string): Promise<void> {
     // Cascading deletes handle questions, search_results, reports
-    const { error } = await this.supabase.from("runs").delete().eq("id", runId)
+    const { error } = await this.db.from("runs").delete().eq("id", runId)
     if (error) {
       logger.warn(`Failed to delete run ${runId}: ${error.message}`)
     } else {
@@ -341,7 +400,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
   }
 
   async listRuns(): Promise<string[]> {
-    const { data, error } = await this.supabase
+    const { data, error } = await this.db
       .from("runs")
       .select("id")
       .order("created_at", { ascending: true })
@@ -533,7 +592,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
 
     // If keeping search results, copy them in DB
     if (fromIndex > PHASE_ORDER.indexOf("search")) {
-      const { data: searchResults } = await this.supabase
+      const { data: searchResults } = await this.db
         .from("search_results")
         .select("*")
         .eq("run_id", sourceRunId)
@@ -545,14 +604,14 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
           results: sr.results,
           metadata: sr.metadata,
         }))
-        await this.supabase.from("search_results").upsert(copied, {
+        await this.db.from("search_results").upsert(copied, {
           onConflict: "run_id,question_id",
         })
       }
     }
 
     // Insert via create + save
-    await this.supabase.from("runs").insert({
+    await this.db.from("runs").insert({
       id: newRunId,
       slug: newRunId,
       user_id: newCheckpoint.userId || null,
@@ -588,7 +647,7 @@ export class SupabaseCheckpointManager implements ICheckpointManager {
     }))
 
     if (questionRows.length > 0) {
-      await this.supabase
+      await this.db
         .from("questions")
         .upsert(questionRows, { onConflict: "run_id,question_id" })
     }

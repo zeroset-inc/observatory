@@ -12,6 +12,10 @@ export interface ServerFetchDependencies {
   serveStaticUi?: (url: URL) => Promise<Response | null>
 }
 
+export interface BackgroundExecutionContext {
+  waitUntil(promise: Promise<unknown>): void
+}
+
 function jsonResponse(data: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers(init.headers)
   headers.set("Content-Type", "application/json")

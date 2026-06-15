@@ -9,6 +9,7 @@ import type {
 } from "../../types/unified"
 import type { BeamConversation, BeamChatMessage, BeamProbingQuestion } from "./types"
 import { logger } from "../../utils/logger"
+import { isWorkerRuntime } from "../../server/runtime"
 
 const DEFAULT_DATA_DIR = "./data/benchmarks/beam"
 const HF_DATASET = "Mohammadta/BEAM"
@@ -73,6 +74,16 @@ export class BeamBenchmark implements Benchmark {
   private sessionsMap: Map<string, UnifiedSession[]> = new Map()
 
   async load(config?: BenchmarkConfig): Promise<void> {
+    if (isWorkerRuntime()) {
+      logger.info("Loading BEAM benchmark dataset from HuggingFace...")
+      const conversations = await this.fetchDataset()
+      for (const conversation of conversations) this.processConversation(conversation)
+      logger.info(
+        `Loaded BEAM benchmark: ${this.questions.length} probing questions from ${conversations.length} conversations`
+      )
+      return
+    }
+
     const dataDir = config?.dataPath || DEFAULT_DATA_DIR
     const fullDir = join(process.cwd(), dataDir)
     const dataFile = join(fullDir, "beam_100k.json")
@@ -95,7 +106,12 @@ export class BeamBenchmark implements Benchmark {
 
   private async downloadDataset(destDir: string, destFile: string): Promise<void> {
     mkdirSync(destDir, { recursive: true })
+    const conversations = await this.fetchDataset()
+    writeFileSync(destFile, JSON.stringify(conversations, null, 2))
+    logger.success(`Downloaded ${conversations.length} BEAM conversations (100K split)`)
+  }
 
+  private async fetchDataset(): Promise<BeamConversation[]> {
     const conversations: BeamConversation[] = []
     let offset = 0
     const pageSize = 100
@@ -123,8 +139,7 @@ export class BeamBenchmark implements Benchmark {
       }
     }
 
-    writeFileSync(destFile, JSON.stringify(conversations, null, 2))
-    logger.success(`Downloaded ${conversations.length} BEAM conversations (100K split)`)
+    return conversations
   }
 
   private processConversation(conversation: BeamConversation): void {

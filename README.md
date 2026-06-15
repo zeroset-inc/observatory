@@ -94,21 +94,25 @@ INGEST  →  INDEX  →  SEARCH  →  EVALUATE  →  REPORT
 
 ```bash
 bun install
-bun dev          # start Observatory on localhost:3003
+cd ui && bun install
+cd ..
+bun run build
+bun run db:migrate:local
+bun dev
 ```
 
 Add your API keys — at least one memory provider key and one LLM judge key.
 
-- **Hosted** ([observatory.trynebula.ai](https://observatory.trynebula.ai)): Open **Settings** in the sidebar. Keys are encrypted per-user and persist across runs.
-- **Self-hosted**: Copy `.env.example` to `.env.local` and fill in your keys:
+- **Hosted** ([observatory.trynebula.ai](https://observatory.trynebula.ai)): Open **Settings** in the sidebar. Keys are encrypted per-user in Cloudflare D1 and persist across runs.
+- **Self-hosted Worker**: copy `.env.example` to `.dev.vars` for local Wrangler development, or set production secrets with `wrangler secret put`:
 
 ```bash
-cp .env.example .env.local
+cp .env.example .dev.vars
+wrangler secret put OBSERVATORY_SECRET
 
 # Memory providers (at least one)
 MEM0_API_KEY=
 NEBULA_API_KEY=
-NEBULA_SECRET_KEY=
 SUPERMEMORY_API_KEY=
 ZEP_API_KEY=
 
@@ -121,9 +125,10 @@ GOOGLE_API_KEY=
 OBSERVATORY_ALLOWED_ORIGINS=http://localhost:3003
 ```
 
-Current server builds require `NEBULA_SECRET_KEY` on self-hosted instances. Set it to the same JWT signing key used by Nebula so the server can verify bearer tokens locally; the Settings UI then becomes available and user-provided keys take priority over environment variables.
+Deployments are owned by Cloudflare Workers now. Apply migrations with `bun run db:migrate:remote`, then deploy with `bun run deploy`.
+Before the first deploy, create the D1 database with `wrangler d1 create observatory` and replace `REPLACE_WITH_D1_DATABASE_ID` in `wrangler.toml` with the returned database ID.
 
-If you are upgrading an existing deployment across the Nebula profile migrations, backfill `profiles.nebula_user_id` and normalized `profiles.email` before `014_finalize_nebula_profiles.sql` runs. That migration intentionally aborts until the profile cutover is complete.
+The Worker entrypoint registers short background work with `ctx.waitUntil`, but full benchmark execution can exceed Worker post-response limits. Production-scale runs should be moved behind a durable runner, such as Cloudflare Queues plus Durable Objects or Workflows, so cancellation, retries, and progress are coordinated outside a single isolate.
 
 If your UI runs on a different origin than the API, add that origin to `OBSERVATORY_ALLOWED_ORIGINS`. The server only sends `Access-Control-Allow-Origin` for allowlisted origins.
 

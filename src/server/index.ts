@@ -4,7 +4,7 @@ import { handleLeaderboardRoutes } from "./routes/leaderboard"
 import { handleCompareRoutes } from "./routes/compare"
 import { handleAuthRoutes } from "./routes/auth"
 import { AuthError } from "./middleware/auth"
-import { WebSocketManager } from "./websocket"
+import { wsManager } from "./wsManager"
 import {
   recoverStaledRuns,
   activeRuns,
@@ -31,17 +31,24 @@ export interface ServerOptions {
 
 const isProduction = process.env.NODE_ENV === "production"
 let uiProcess: Subprocess | null = null
+const D1_INTERRUPTED_RUN_ID_CHUNK_SIZE = 97
 
-export const wsManager = new WebSocketManager()
+function chunks<T>(items: T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size))
+  }
+  return out
+}
 
 /**
  * Auto-resume runs that were gracefully interrupted by a previous shutdown.
  * Loads checkpoint data to reconstruct run parameters and restarts them.
  */
 async function resumeInterruptedRuns(): Promise<void> {
-  const { supabase } = require("./db/supabase")
+  const { db } = require("./db")
 
-  const { data: interrupted, error } = await supabase
+  const { data: interrupted, error } = await db
     .from("runs")
     .select("id, provider, benchmark, judge, user_id, sampling, concurrency")
     .eq("status", "interrupted")
@@ -99,14 +106,14 @@ async function resumeInterruptedRuns(): Promise<void> {
     } catch (e) {
       logger.error(`Failed to resume run ${run.id}: ${e}`)
       // Mark as failed so it doesn't retry on next startup
-      await supabase.from("runs").update({ status: "failed" }).eq("id", run.id)
+      await db.from("runs").update({ status: "failed" }).eq("id", run.id)
     }
   }
 }
 
 async function checkReadiness(): Promise<void> {
-  const { supabase } = await import("./db/supabase")
-  const { error } = await supabase
+  const { db } = await import("./db")
+  const { error } = await db
     .from("runs")
     .select("id")
     .limit(1)
@@ -165,9 +172,8 @@ async function serveStaticUi(url: URL): Promise<Response | null> {
 export async function startServer(options: ServerOptions): Promise<void> {
   const { port, open = true } = options
 
-  // Auto-run migrations. Failures are non-fatal only because the direct Postgres
-  // connection may be unreachable even when Supabase (used by all routes) is fine.
-  // If the schema is actually missing, routes will 500 on their own.
+  // D1 migrations are applied by Wrangler; this hook is retained for the legacy
+  // Bun server path and intentionally does not apply schema changes at runtime.
   try {
     await runMigrations()
   } catch (e) {
@@ -277,16 +283,22 @@ export async function startServer(options: ServerOptions): Promise<void> {
       // Only mark runs that are still active (didn't finish during drain) as interrupted
       const stillActive = runIds.filter((id) => activeRuns.has(id))
       if (stillActive.length > 0) {
-        const { supabase } = require("./db/supabase")
-        const { error: updateError } = await supabase
-          .from("runs")
-          .update({ status: "interrupted", active_status: null })
-          .in("id", stillActive)
-          .neq("status", "completed")
-        if (updateError) {
-          logger.error(`Failed to mark runs as interrupted: ${updateError.message}`)
-        } else {
-          logger.info(`${stillActive.length} run(s) marked as interrupted for auto-resume.`)
+        const { db } = require("./db")
+        let interruptedCount = 0
+        for (const runIdChunk of chunks(stillActive, D1_INTERRUPTED_RUN_ID_CHUNK_SIZE)) {
+          const { error: updateError } = await db
+            .from("runs")
+            .update({ status: "interrupted", active_status: null })
+            .in("id", runIdChunk)
+            .neq("status", "completed")
+          if (updateError) {
+            logger.error(`Failed to mark runs as interrupted: ${updateError.message}`)
+          } else {
+            interruptedCount += runIdChunk.length
+          }
+        }
+        if (interruptedCount > 0) {
+          logger.info(`${interruptedCount} run(s) marked as interrupted for auto-resume.`)
         }
       }
     }

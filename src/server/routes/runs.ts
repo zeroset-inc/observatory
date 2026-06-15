@@ -1,7 +1,7 @@
 import type { ICheckpointManager } from "../../orchestrator/checkpoint"
-import { SupabaseCheckpointManager } from "../../orchestrator/supabaseCheckpoint"
+import { D1CheckpointManager } from "../../orchestrator/d1Checkpoint"
 import { orchestrator } from "../../orchestrator"
-import { wsManager } from "../index"
+import { wsManager } from "../wsManager"
 import { activeRuns, startRun, startRunIfIdle, endRun, requestStop, isRunActive, getRunState, acquireRetrySlot, releaseRetrySlot, setCompletion, waitForCompletionWithTimeout } from "../runState"
 import { createBenchmark } from "../../benchmarks"
 import { createProvider } from "../../providers"
@@ -16,10 +16,18 @@ import type { ConcurrencyConfig } from "../../types/concurrency"
 import { getPhasesFromPhase, PHASE_ORDER } from "../../types/checkpoint"
 import { autoAddToLeaderboard } from "./leaderboard"
 import { generateReport, saveReport } from "../../orchestrator/phases/report"
+import type { BackgroundExecutionContext } from "../http"
+import {
+  beginRunDelete,
+  durableRunnerAvailable,
+  enqueueRunStart,
+  releaseRunDelete,
+  requestRunStop as requestDurableRunStop,
+} from "../../runner/client"
 
 function getCheckpointManager(): ICheckpointManager {
-  const { supabase } = require("../db/supabase")
-  return new SupabaseCheckpointManager(supabase)
+  const { db } = require("../db")
+  return new D1CheckpointManager(db)
 }
 
 const checkpointManager = getCheckpointManager()
@@ -46,12 +54,22 @@ function json(data: unknown, status = 200): Response {
   })
 }
 
+const D1_IN_CHUNK_SIZE = 99
+
+function chunks<T>(items: T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size))
+  }
+  return out
+}
+
 async function verifyRunOwnership(runId: string, user: import("../middleware/auth").AuthUser | null): Promise<Response | null> {
   if (!user) {
     return json({ error: "Authentication required" }, 401)
   }
-  const { supabase } = require("../db/supabase")
-  const { data: run, error } = await supabase
+  const { db } = require("../db")
+  const { data: run, error } = await db
     .from("runs")
     .select("user_id")
     .eq("id", runId)
@@ -73,8 +91,8 @@ async function verifyRunOwnership(runId: string, user: import("../middleware/aut
  * Completed runs are public; non-completed runs require ownership.
  */
 async function verifyRunVisibility(runId: string, user: import("../middleware/auth").AuthUser | null): Promise<Response | null> {
-  const { supabase } = require("../db/supabase")
-  const { data: run, error } = await supabase
+  const { db } = require("../db")
+  const { data: run, error } = await db
     .from("runs")
     .select("status, user_id")
     .eq("id", runId)
@@ -93,7 +111,11 @@ async function verifyRunVisibility(runId: string, user: import("../middleware/au
   return null
 }
 
-export async function handleRunsRoutes(req: Request, url: URL): Promise<Response | null> {
+export async function handleRunsRoutes(
+  req: Request,
+  url: URL,
+  executionContext?: BackgroundExecutionContext
+): Promise<Response | null> {
   const method = req.method
   const pathname = url.pathname
 
@@ -104,8 +126,8 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     const user = await optionalAuth(req)
     const view = url.searchParams.get("view")
 
-    const { supabase } = require("../db/supabase")
-    let query = supabase.from("runs").select("*").order("created_at", { ascending: false })
+    const { db } = require("../db")
+    let query = db.from("runs").select("*").order("created_at", { ascending: false })
 
     if (view === "mine") {
       if (!user) return json({ error: "Authentication required" }, 401)
@@ -200,8 +222,8 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     const visError = await verifyRunVisibility(runId, user)
     if (visError) return visError
 
-    const { supabase } = require("../db/supabase")
-    const { data, error } = await supabase
+    const { db } = require("../db")
+    const { data, error } = await db
       .from("reports")
       .select("report_data")
       .eq("run_id", runId)
@@ -279,8 +301,8 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
       return json({ error: "Question not found" }, 404)
     }
 
-    const { supabase } = require("../db/supabase")
-    const { data } = await supabase
+    const { db } = require("../db")
+    const { data } = await db
       .from("search_results")
       .select("*")
       .eq("run_id", runId)
@@ -304,7 +326,7 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
   if (method === "POST" && pathname === "/api/runs/preflight") {
     try {
       const user = await optionalAuth(req)
-      const body = await req.json()
+      const body = (await req.json()) as Record<string, any>
       const { provider, judgeModel } = body
 
       if (!provider || !judgeModel) {
@@ -352,10 +374,10 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
       }
 
       // Rate limit: 10 runs per user per day
-      const { supabase } = require("../db/supabase")
+      const { db } = require("../db")
       const todayStart = new Date()
       todayStart.setUTCHours(0, 0, 0, 0)
-      const { count, error: countError } = await supabase
+      const { count, error: countError } = await db
         .from("runs")
         .select("*", { count: "exact", head: true })
         .eq("user_id", user.id)
@@ -368,7 +390,7 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
       }
 
       const userKeys = await fetchAllUserKeys(user.id)
-      const body = await req.json()
+      const body = (await req.json()) as Record<string, any>
       console.log("[API] Start run request body:", JSON.stringify(body, null, 2))
       const {
         provider,
@@ -430,8 +452,22 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
         )
       }
 
-      if (activeRuns.has(runId)) {
+      if (!durableRunnerAvailable() && activeRuns.has(runId)) {
         return json({ error: "Run is already active" }, 409)
+      }
+
+      if (!sourceRunId) {
+        const { data: existingRun, error: existingRunError } = await db
+          .from("runs")
+          .select("user_id")
+          .eq("id", runId)
+          .maybeSingle()
+        if (existingRunError) {
+          return json({ error: "Failed to verify run ownership" }, 500)
+        }
+        if (existingRun?.user_id && existingRun.user_id !== user.id) {
+          return json({ error: "Run already exists" }, 409)
+        }
       }
 
       if (sourceRunId) {
@@ -475,8 +511,30 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
         await checkpointManager.flush(runId)
       }
 
-      startRun(runId, benchmark, user.id)
+      if (durableRunnerAvailable()) {
+        const result = await enqueueRunStart({
+          kind: "run.start",
+          provider: provider as ProviderName,
+          benchmark: benchmark as BenchmarkName,
+          runId,
+          judgeModel,
+          userId: user.id,
+          limit,
+          sampling,
+          concurrency,
+          searchEffort,
+          force: sourceRunId ? false : force,
+          fromPhase: fromPhase as PhaseId | undefined,
+        })
 
+        if (!result.ok) {
+          return json(result.data, result.status)
+        }
+
+        return json({ message: "Run started", runId })
+      }
+
+      startRun(runId, benchmark, user.id)
       const completion = runBenchmark({
         provider: provider as ProviderName,
         benchmark: benchmark as BenchmarkName,
@@ -494,6 +552,7 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
         endRun(runId)
       })
       setCompletion(runId, completion)
+      executionContext?.waitUntil(completion)
 
       return json({ message: "Run started", runId })
     } catch (e) {
@@ -574,14 +633,17 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     // Helper: release slot, persist failed status, broadcast, and call endRun if last.
     // Also resolves the sentinel completion promise so DELETE stops waiting.
     const releaseSlot = async () => {
+      const { db } = require("../db")
+      const { error } = await db
+        .from("runs")
+        .update({ status: "failed" })
+        .eq("id", runId)
+      if (error) {
+        console.error(`[retry] Failed to persist failed status for run ${runId}:`, error.message)
+      }
+
       const isLast = releaseRetrySlot(runId)
       if (isLast) {
-        try {
-          checkpointManager.updateStatus(checkpoint, "failed")
-          await checkpointManager.flush(runId)
-        } catch (e) {
-          console.error(`[retry] Failed to persist failed status for run ${runId}:`, e)
-        }
         wsManager.broadcast({
           type: "run_finished",
           runId,
@@ -594,7 +656,7 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
 
     try {
 
-      const { supabase } = require("../db/supabase")
+      const { db } = require("../db")
       const userKeys = user ? await fetchAllUserKeys(user.id) : undefined
 
       // Only clear provider-side data when retrying from ingest (full retry).
@@ -626,7 +688,35 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
         }
       }
 
-      // Reset only the phases from startPhase onward
+      // Delete search results if retrying from search or earlier
+      if (phaseIndex <= validPhases.indexOf("search")) {
+        const deleteFailures: string[] = []
+        for (const questionIdChunk of chunks(questionIds, D1_IN_CHUNK_SIZE)) {
+          const { error: deleteError } = await db
+            .from("search_results")
+            .delete()
+            .eq("run_id", runId)
+            .in("question_id", questionIdChunk)
+          if (deleteError) deleteFailures.push(deleteError.message)
+        }
+        if (deleteFailures.length > 0) {
+          await releaseSlot()
+          return json({
+            error: `Failed to delete search results for retry: ${deleteFailures.join("; ")}`,
+          }, 500)
+        }
+      }
+
+      const { error: reportDeleteError } = await db
+        .from("reports")
+        .delete()
+        .eq("run_id", runId)
+      if (reportDeleteError) {
+        await releaseSlot()
+        return json({ error: `Failed to delete stale report: ${reportDeleteError.message}` }, 500)
+      }
+
+      // Reset only the phases from startPhase onward after cleanup succeeds.
       for (const qId of questionIds) {
         const q = checkpoint.questions[qId]
         for (const phase of phasesToReset) {
@@ -641,20 +731,6 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
           }
         }
       }
-
-      // Delete search results if retrying from search or earlier
-      if (phaseIndex <= validPhases.indexOf("search")) {
-        await supabase
-          .from("search_results")
-          .delete()
-          .eq("run_id", runId)
-          .in("question_id", questionIds)
-      }
-
-      await supabase
-        .from("reports")
-        .delete()
-        .eq("run_id", runId)
 
       // Save only the retried questions — passing questionIds avoids
       // overwriting other questions with stale data from this snapshot.
@@ -697,12 +773,9 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
                   (q) => Object.values(q.phases).some((p) => p.status === "failed")
                 )
                 const recomputedStatus = allDone ? "completed" : anyFailed ? "failed" : "interrupted"
-                // Preserve "failed" if the error handler already set it (e.g. retry
-                // died during provider/judge init before any phase marked a question
-                // as failed). Don't downgrade to "interrupted".
-                finalStatus = finalCheckpoint.status === "failed" && recomputedStatus === "interrupted"
-                  ? "failed"
-                  : recomputedStatus
+                // Preserve explicit setup failures; they are written directly to
+                // the run row to avoid saving a stale checkpoint snapshot.
+                finalStatus = finalCheckpoint.status === "failed" ? "failed" : recomputedStatus
                 checkpointManager.updateStatus(finalCheckpoint, finalStatus)
                 await checkpointManager.flush(runId)
 
@@ -743,6 +816,7 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
         }
       })
       setCompletion(runId, retryCompletion)
+      executionContext?.waitUntil(retryCompletion)
       // The real completion is now tracked — resolve the sentinel so the
       // combined Promise.all only depends on retryCompletion going forward.
       resolveSetup()
@@ -758,13 +832,21 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
   const stopMatch = pathname.match(/^\/api\/runs\/([^/]+)\/stop$/)
   if (method === "POST" && stopMatch) {
     const runId = decodeURIComponent(stopMatch[1])
-    if (!isRunActive(runId)) {
-      return json({ error: "Run is not active" }, 404)
-    }
-
     const user = await optionalAuth(req)
     if (!user) {
       return json({ error: "Authentication required" }, 401)
+    }
+
+    if (durableRunnerAvailable()) {
+      const ownerError = await verifyRunOwnership(runId, user)
+      if (ownerError) return ownerError
+
+      const result = await requestDurableRunStop(runId)
+      return json(result.data, result.status)
+    }
+
+    if (!isRunActive(runId)) {
+      return json({ error: "Run is not active" }, 404)
     }
 
     // For initializing runs the DB row may not exist yet — check in-memory state
@@ -790,9 +872,18 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     const ownerError = await verifyRunOwnership(runId, user)
     if (ownerError) return ownerError
 
+    let deleteLocked = false
+    if (durableRunnerAvailable()) {
+      const lockResult = await beginRunDelete(runId)
+      if (!lockResult.ok) {
+        return json(lockResult.data, lockResult.status)
+      }
+      deleteLocked = true
+    }
+
     // If run is active, stop it and wait for the background process to
     // fully wind down before deleting any data.
-    if (isRunActive(runId)) {
+    if (!durableRunnerAvailable() && isRunActive(runId)) {
       requestStop(runId)
       const DELETE_TIMEOUT_MS = 30_000
       const settled = await waitForCompletionWithTimeout(runId, DELETE_TIMEOUT_MS)
@@ -803,23 +894,29 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
 
     const cleanup = url.searchParams.get("cleanup") === "true"
 
-    if (cleanup) {
-      try {
-        const checkpoint = await checkpointManager.load(runId)
-        if (checkpoint) {
-          const ownerId = checkpoint.userId
-          const userKeys = ownerId ? await fetchAllUserKeys(ownerId) : undefined
-          const provider = createProvider(checkpoint.provider as ProviderName)
-          await provider.initialize(getProviderConfig(checkpoint.provider, userKeys))
-          await checkpointManager.deleteWithCleanup(runId, provider)
-        } else {
-          await checkpointManager.delete(runId)
+    try {
+      if (cleanup) {
+        try {
+          const checkpoint = await checkpointManager.load(runId)
+          if (checkpoint) {
+            const ownerId = checkpoint.userId
+            const userKeys = ownerId ? await fetchAllUserKeys(ownerId) : undefined
+            const provider = createProvider(checkpoint.provider as ProviderName)
+            await provider.initialize(getProviderConfig(checkpoint.provider, userKeys))
+            await checkpointManager.deleteWithCleanup(runId, provider)
+          } else {
+            await checkpointManager.delete(runId)
+          }
+        } catch (e) {
+          return json({ error: `Failed to delete with cleanup: ${e}` }, 500)
         }
-      } catch (e) {
-        return json({ error: `Failed to delete with cleanup: ${e}` }, 500)
+      } else {
+        await checkpointManager.delete(runId)
       }
-    } else {
-      await checkpointManager.delete(runId)
+    } finally {
+      if (deleteLocked) {
+        await releaseRunDelete(runId)
+      }
     }
 
     return json({ message: "Run deleted", runId })
@@ -833,6 +930,13 @@ function isPublicRunStatus(status: string): boolean {
 }
 
 function getRunStatusFromDb(run: any, summary: any): string {
+  if (
+    (run.active_status === "running" || run.active_status === "stopping") &&
+    isActiveLeaseCurrent(run.active_lease_expires_at)
+  ) {
+    return run.active_status
+  }
+
   // Active process takes priority
   const runState = getRunState(run.id)
   if (runState) return runState.status
@@ -853,6 +957,13 @@ function getRunStatusFromDb(run: any, summary: any): string {
 }
 
 function getRunStatus(checkpoint: any, summary: any): string {
+  if (
+    (checkpoint.activeStatus === "running" || checkpoint.activeStatus === "stopping") &&
+    isActiveLeaseCurrent(checkpoint.activeLeaseExpiresAt)
+  ) {
+    return checkpoint.activeStatus
+  }
+
   const runState = getRunState(checkpoint.runId)
   if (runState) {
     return runState.status
@@ -895,6 +1006,11 @@ function getRunStatus(checkpoint: any, summary: any): string {
     return "pending"
   }
   return "partial"
+}
+
+function isActiveLeaseCurrent(expiresAt?: string | null): boolean {
+  if (!expiresAt) return true
+  return new Date(expiresAt).getTime() > Date.now()
 }
 
 async function runBenchmark(options: {
@@ -972,8 +1088,8 @@ async function runBenchmark(options: {
     // Persist the failure state directly in the DB — avoid updateStatus/save
     // which would write ALL questions and could overwrite concurrent retries'
     // progress with stale data from this snapshot.
-    const { supabase: sb } = require("../db/supabase")
-    await sb.from("runs").update({ status: "failed" }).eq("id", options.runId)
+    const { db } = require("../db")
+    await db.from("runs").update({ status: "failed" }).eq("id", options.runId)
 
     if (!options.skipLifecycleEvents) {
       const wasStoppedByUser = message.includes("stopped by user")

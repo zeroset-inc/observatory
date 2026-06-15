@@ -9,6 +9,7 @@ import type {
 } from "../../types/unified"
 import type { AtlasBenchmarkFile } from "./types"
 import { logger } from "../../utils/logger"
+import { isWorkerRuntime } from "../../server/runtime"
 
 const DEFAULT_DATA_DIR = "./data/benchmarks/atlas"
 const GITHUB_BASE_URL = "https://raw.githubusercontent.com/nebula-agi/atlas/main"
@@ -75,6 +76,20 @@ export class AtlasBenchmark implements Benchmark {
   private sessionsMap: Map<string, UnifiedSession[]> = new Map()
 
   async load(config?: BenchmarkConfig): Promise<void> {
+    if (isWorkerRuntime()) {
+      logger.info("Loading Atlas benchmark dataset from GitHub...")
+      for (const name of SIMPLE_FILES) {
+        const data = await this.fetchFile(`${GITHUB_BASE_URL}/simple_test_set/${name}.json`)
+        this.processFile(data, name, "simple")
+      }
+      for (const name of COMPLEX_FILES) {
+        const data = await this.fetchFile(`${GITHUB_BASE_URL}/complex_test_set/${name}.json`)
+        this.processFile(data, name, "complex")
+      }
+      logger.info(`Loaded Atlas benchmark: ${this.questions.length} probes`)
+      return
+    }
+
     const dataDir = config?.dataPath || DEFAULT_DATA_DIR
     const fullDir = join(process.cwd(), dataDir)
 
@@ -145,6 +160,12 @@ export class AtlasBenchmark implements Benchmark {
     }
     const data = await response.text()
     writeFileSync(dest, data)
+  }
+
+  private async fetchFile(url: string): Promise<AtlasBenchmarkFile> {
+    const response = await fetch(url)
+    if (!response.ok) throw new Error(`Failed to download ${url}: ${response.status}`)
+    return (await response.json()) as AtlasBenchmarkFile
   }
 
   private processFile(data: AtlasBenchmarkFile, fileId: string, testSet: string): void {

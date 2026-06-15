@@ -11,6 +11,7 @@ import type {
 } from "../../types/unified"
 import type { LongMemEvalItem } from "./types"
 import { logger } from "../../utils/logger"
+import { isWorkerRuntime } from "../../server/runtime"
 
 const DEFAULT_DATA_PATH = "./data/benchmarks/longmemeval/datasets"
 const HF_DATASET_URL =
@@ -89,6 +90,16 @@ export class LongMemEvalBenchmark implements Benchmark {
   private dataPath: string = ""
 
   async load(config?: BenchmarkConfig): Promise<void> {
+    if (isWorkerRuntime()) {
+      logger.info("Loading LongMemEval dataset from HuggingFace...")
+      const response = await fetch(HF_DATASET_URL)
+      if (!response.ok) throw new Error(`Failed to download dataset: ${response.status}`)
+      const dataset = (await response.json()) as LongMemEvalItem[]
+      for (const item of dataset) this.addQuestion(item)
+      logger.info(`Loaded ${this.questions.length} questions from LongMemEval`)
+      return
+    }
+
     this.dataPath = config?.dataPath || DEFAULT_DATA_PATH
     const fullPath = join(process.cwd(), this.dataPath)
     const rawDataPath = join(fullPath, "longmemeval_s_cleaned.json")
@@ -178,26 +189,27 @@ export class LongMemEvalBenchmark implements Benchmark {
 
     for (const file of files) {
       const item: LongMemEvalItem = JSON.parse(readFileSync(join(questionsDir, file), "utf8"))
-      this.data.push(item)
-
-      const sessions = this.extractSessions(item)
-      const sessionIds = sessions.map((s) => s.sessionId)
-
-      this.questions.push({
-        questionId: item.question_id,
-        question: item.question,
-        questionType: item.question_type,
-        groundTruth: item.answer,
-        haystackSessionIds: sessionIds,
-        metadata: {
-          questionDate: item.question_date,
-        },
-      })
-
-      this.sessionsMap.set(item.question_id, sessions)
+      this.addQuestion(item)
     }
 
     logger.info(`Loaded ${this.questions.length} questions from LongMemEval`)
+  }
+
+  private addQuestion(item: LongMemEvalItem): void {
+    this.data.push(item)
+    const sessions = this.extractSessions(item)
+    const sessionIds = sessions.map((s) => s.sessionId)
+    this.questions.push({
+      questionId: item.question_id,
+      question: item.question,
+      questionType: item.question_type,
+      groundTruth: item.answer,
+      haystackSessionIds: sessionIds,
+      metadata: {
+        questionDate: item.question_date,
+      },
+    })
+    this.sessionsMap.set(item.question_id, sessions)
   }
 
   private extractSessions(item: LongMemEvalItem): UnifiedSession[] {

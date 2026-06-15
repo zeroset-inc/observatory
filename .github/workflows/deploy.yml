@@ -1,21 +1,4 @@
-name: Build and Publish Observatory
-# Observatory's CI is a pure publisher now: it builds the image on every
-# push to main and pushes it to
-# 372867010033.dkr.ecr.us-east-1.amazonaws.com/observatory. Rolling out
-# to the k3s cluster is owned exclusively by nebula's deploy-manifests
-# pipeline, which consumes this image via
-# backend/nebula-r2r/deployment/observatory.lock.json. After each
-# successful ECR push, this workflow fires a `repository_dispatch`
-# event at nebula so nebula's bump-observatory-pin workflow can open a
-# lock-file bump PR immediately — no polling, no "guess the latest"
-# on the nebula side.
-#
-# Credentials for the cross-repo dispatch come from a GitHub App
-# (`nebula-deploy-bot`) installed on both this repo and nebula-agi/nebula,
-# with Contents: write + Pull requests: write on nebula. The App token
-# is short-lived (minted per run) and there is no long-lived PAT to
-# rotate. App setup is a one-time operator step — see nebula's
-# .github/workflows/bump-observatory-pin.yml header for the full list.
+name: Deploy Observatory Worker
 
 on:
   push:
@@ -23,113 +6,57 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write
   contents: read
 
-env:
-  AWS_REGION: us-east-1
-  ECR_REGISTRY: 372867010033.dkr.ecr.us-east-1.amazonaws.com
-  ECR_REPOSITORY: observatory
-
 jobs:
-  build-and-push:
+  deploy:
     runs-on: ubuntu-latest
     concurrency:
-      group: build-observatory
+      group: deploy-observatory-worker
       cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          role-to-assume: arn:aws:iam::372867010033:role/github-nebula
-          role-session-name: GitHubActions-Observatory
-          aws-region: ${{ env.AWS_REGION }}
+          bun-version: latest
 
-      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Install API dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
 
-      - name: Fetch Supabase config for UI build
-        id: supabase
-        run: |
-          SECRET=$(aws secretsmanager get-secret-value --secret-id nebula/supabase-config --query SecretString --output text)
-          {
-            echo "url=$(echo "$SECRET" | jq -r .supabase_url)"
-            echo "anon_key=$(echo "$SECRET" | jq -r .supabase_anon_key)"
-          } >> "$GITHUB_OUTPUT"
+      - name: Install UI dependencies
+        working-directory: ui
+        run: bun install --frozen-lockfile --ignore-scripts
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Build UI assets
+        run: bun run build
 
-      - name: Build and push Docker image (arm64)
-        id: build
+      - name: Resolve D1 database id and inject into wrangler.toml
+        # The "observatory" D1 database is provisioned by Terraform in the nebula
+        # monorepo (infra/cloudflare). Resolve its id by name at deploy time so the
+        # two repos stay decoupled — no shared variable to keep in sync. Requires the
+        # nebula Terraform to have been applied first (the lookup fails loudly if not).
         env:
-          SUPABASE_URL: ${{ steps.supabase.outputs.url }}
-          SUPABASE_ANON_KEY: ${{ steps.supabase.outputs.anon_key }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          set -euo pipefail
-          IMAGE_TAG="${{ github.sha }}"
-          METADATA_FILE="$RUNNER_TEMP/buildx-metadata.json"
-
-          docker buildx build \
-            --platform linux/arm64 \
-            --build-arg "VITE_SUPABASE_URL=$SUPABASE_URL" \
-            --build-arg "VITE_SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
-            --push \
-            --metadata-file "$METADATA_FILE" \
-            .
-
-          # buildx writes containerimage.digest for multi-arch builds as
-          # the manifest-index digest — exactly what we want to pin on
-          # the nebula side. Without --metadata-file we'd have to
-          # `aws ecr describe-images` right after the push to discover
-          # the digest, which introduces a TOCTOU between push and
-          # dispatch.
-          IMAGE_DIGEST=$(jq -r '."containerimage.digest"' "$METADATA_FILE")
-          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "null" ]; then
-            echo "::error::buildx metadata did not include containerimage.digest"
-            cat "$METADATA_FILE"
+          id=$(bunx wrangler d1 list --json | jq -r '.[] | select(.name == "observatory") | (.uuid // .id)')
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::error::D1 database 'observatory' not found in this Cloudflare account. Apply the nebula infra/cloudflare Terraform first." >&2
             exit 1
           fi
+          sed -i "s|REPLACE_WITH_D1_DATABASE_ID|${id}|" wrangler.toml
+          echo "Resolved D1 'observatory' id and injected into wrangler.toml."
 
-          {
-            echo "image_tag=$IMAGE_TAG"
-            echo "image_digest=$IMAGE_DIGEST"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "Published $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG@$IMAGE_DIGEST"
-
-      - name: Mint nebula-deploy-bot token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.NEBULA_DEPLOY_BOT_APP_ID }}
-          private-key: ${{ secrets.NEBULA_DEPLOY_BOT_PRIVATE_KEY }}
-          owner: nebula-agi
-          repositories: nebula
-
-      - name: Notify nebula to bump observatory pin
+      - name: Apply D1 migrations
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          IMAGE_REPOSITORY: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ steps.build.outputs.image_tag }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}
-        run: |
-          set -euo pipefail
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bunx wrangler d1 migrations apply observatory --remote
 
-          # Send the EXACT payload we just published. Nebula's bump
-          # workflow verifies the digest exists in ECR before acting
-          # on it, so a dropped event is safe (the reconciler cron
-          # will catch up within 24h) but a stale payload never leaks
-          # through.
-          gh api repos/nebula-agi/nebula/dispatches \
-            --method POST \
-            --field event_type=observatory-image-published \
-            --raw-field "client_payload[image_repository]=$IMAGE_REPOSITORY" \
-            --raw-field "client_payload[image_tag]=$IMAGE_TAG" \
-            --raw-field "client_payload[image_digest]=$IMAGE_DIGEST"
-
-          echo "Dispatched observatory-image-published to nebula: $IMAGE_REPOSITORY:$IMAGE_TAG@$IMAGE_DIGEST"
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bunx wrangler deploy
