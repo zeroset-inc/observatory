@@ -11,7 +11,6 @@ const state: State = {
   user_api_keys: [],
 }
 
-const fetchCalls: Array<{ url: string; init?: RequestInit }> = []
 let fetchHandler: (url: string, init?: RequestInit) => Response | Promise<Response>
 
 function tableRows(table: string): Row[] {
@@ -165,7 +164,6 @@ describe("Nebula-backed auth routes", () => {
   beforeEach(() => {
     state.profiles = []
     state.user_api_keys = []
-    fetchCalls.length = 0
     process.env.OBSERVATORY_SECRET = "test-secret"
     process.env.NEBULA_BASE_URL = "https://api.zeroset.com"
     fetchHandler = (url, init) => {
@@ -177,7 +175,6 @@ describe("Nebula-backed auth routes", () => {
     }
     globalThis.fetch = mock((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      fetchCalls.push({ url, init })
       return Promise.resolve(fetchHandler(url, init))
     }) as typeof fetch
   })

@@ -7,7 +7,6 @@ import {
   isValidKeyName,
 } from "../services/apiKeys"
 import { clearSessionCookie, getSessionIdFromRequest, setSessionCookie } from "../sessionCookie"
-import { db } from "../db"
 import {
   extractNebulaSessionCookie,
   nebulaApiUrl,
@@ -175,22 +174,6 @@ export async function handleAuthRoutes(req: Request, url: URL): Promise<Response
       if (e instanceof AuthError && e.status === 401) return json({ active: false, user: null })
       if (e instanceof AuthError) return json({ error: e.message }, e.status)
       return json({ error: "Authentication service unavailable" }, 503)
-    }
-  }
-
-  if (method === "PUT" && pathname === "/api/auth/profile") {
-    try {
-      const user = await requireAuth(req)
-      const body = (await req.json()) as Record<string, any>
-      const updates: Record<string, any> = { updated_at: new Date().toISOString() }
-      if (body.displayName !== undefined) updates.display_name = body.displayName
-      if (body.avatarUrl !== undefined) updates.avatar_url = body.avatarUrl
-      const { error } = await db.from("profiles").update(updates).eq("id", user.id)
-      if (error) return json({ error: error.message }, 500)
-      return json({ message: "Profile updated" })
-    } catch (e) {
-      if (e instanceof AuthError) return json({ error: e.message }, e.status)
-      return json({ error: "Unauthorized" }, 401)
     }
   }
 
