@@ -154,4 +154,59 @@ describe("sweepRunner", () => {
       )
     ).toBe(true)
   })
+
+  test("stopped parents terminalize even when runnable tasks were already cancelled", async () => {
+    const d1 = new FakeD1()
+    d1.allRows = [
+      [],
+      [],
+      [],
+      [{ id: "run-1" }],
+      [],
+      [{ id: "compare-1" }],
+      [],
+      [],
+      [],
+    ]
+    d1.firstRows = [
+      {
+        status: "running",
+        active_status: "stopping",
+        active_execution_token: "execution-1",
+        active_lease_expires_at: "2999-01-01T00:00:00.000Z",
+      },
+      { count: 0 },
+      {
+        active_status: "stopping",
+        active_lease_token: "lease-1",
+        active_lease_expires_at: "2999-01-01T00:00:00.000Z",
+      },
+      { execution_token: "compare-execution-1" },
+      { count: 0 },
+    ]
+
+    const result = await sweepRunner({
+      OBSERVATORY_DB: d1,
+      OBSERVATORY_RUNNER_QUEUE: {
+        send: async () => {},
+      },
+    } as any)
+
+    expect(result.stoppedRuns).toBe(1)
+    expect(result.stoppedComparisons).toBe(1)
+    expect(
+      d1.prepared.some((statement) =>
+        statement.sql.includes("FROM runs") &&
+        statement.sql.includes("active_status = 'stopping'") &&
+        !statement.sql.includes("JOIN runner_tasks")
+      )
+    ).toBe(true)
+    expect(
+      d1.prepared.some((statement) =>
+        statement.sql.includes("FROM comparisons") &&
+        statement.sql.includes("active_status = 'stopping'") &&
+        !statement.sql.includes("JOIN runner_tasks")
+      )
+    ).toBe(true)
+  })
 })

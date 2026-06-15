@@ -125,11 +125,9 @@ export async function sweepRunner(env: ObservatoryEnv): Promise<{
 
   const stoppingRunRows = await env.OBSERVATORY_DB
     .prepare(
-      `SELECT DISTINCT runs.id
+      `SELECT id
        FROM runs
-       JOIN runner_tasks ON runner_tasks.run_id = runs.id
-       WHERE runs.active_status = 'stopping'
-         AND runner_tasks.status IN ('queued', 'executing')
+       WHERE active_status = 'stopping'
        LIMIT ?`
     )
     .bind(SWEEP_TASK_LIMIT)
@@ -143,11 +141,9 @@ export async function sweepRunner(env: ObservatoryEnv): Promise<{
 
   const stoppingComparisonRows = await env.OBSERVATORY_DB
     .prepare(
-      `SELECT DISTINCT comparisons.id
+      `SELECT id
        FROM comparisons
-       JOIN runner_tasks ON runner_tasks.compare_id = comparisons.id
-       WHERE comparisons.active_status = 'stopping'
-         AND runner_tasks.status IN ('queued', 'executing')
+       WHERE active_status = 'stopping'
        LIMIT ?`
     )
     .bind(SWEEP_TASK_LIMIT)
