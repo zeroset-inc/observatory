@@ -15,7 +15,10 @@ class FakeStatement {
   }
 
   async all() {
-    return { results: this.db.allResults.length > 0 ? this.db.allResults.shift() : this.db.nextResults.splice(0) }
+    return {
+      results:
+        this.db.allResults.length > 0 ? this.db.allResults.shift() : this.db.nextResults.splice(0),
+    }
   }
 
   async first() {
@@ -87,9 +90,7 @@ describe("D1Client adapter", () => {
       question_id: `q-${index}`,
     }))
 
-    const result = await client
-      .from("questions")
-      .upsert(rows, { onConflict: "run_id,question_id" })
+    const result = await client.from("questions").upsert(rows, { onConflict: "run_id,question_id" })
 
     expect(result.error).toBeNull()
     expect(d1.batches.map((batch) => batch.length)).toEqual([50, 50, 20])
@@ -155,10 +156,12 @@ describe("D1Client adapter", () => {
       })),
     ]
 
-    const result = await client.from("auth_users").select("*, profiles:profiles(*)")
+    const result = await client.from("leaderboard_entries").select("*, profiles:user_id(*)")
 
     expect(result.error).toBeNull()
-    expect(d1.prepared.filter((statement) => statement.sql.includes("FROM profiles"))).toHaveLength(2)
+    expect(d1.prepared.filter((statement) => statement.sql.includes("FROM profiles"))).toHaveLength(
+      2
+    )
     expect((result.data as any[])[100].profiles.display_name).toBe("User user-100")
   })
 

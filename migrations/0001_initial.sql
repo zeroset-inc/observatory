@@ -1,31 +1,15 @@
-CREATE TABLE IF NOT EXISTS auth_users (
-  id TEXT PRIMARY KEY NOT NULL,
-  email TEXT NOT NULL UNIQUE,
-  password_salt TEXT NOT NULL,
-  password_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE TABLE IF NOT EXISTS auth_sessions (
-  id TEXT PRIMARY KEY NOT NULL,
-  user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
-  email TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at);
-
 CREATE TABLE IF NOT EXISTS profiles (
-  id TEXT PRIMARY KEY NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+  id TEXT PRIMARY KEY NOT NULL,
   display_name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   avatar_url TEXT,
-  nebula_user_id TEXT,
+  nebula_user_id TEXT UNIQUE,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_nebula_user_id
+ON profiles(nebula_user_id)
+WHERE nebula_user_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS user_api_keys (
   id TEXT PRIMARY KEY NOT NULL,

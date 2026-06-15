@@ -41,7 +41,6 @@ const JSON_COLUMNS = new Set([
 ])
 
 const INSERT_IDS = new Set([
-  "auth_users",
   "profiles",
   "user_api_keys",
   "questions",
@@ -51,7 +50,6 @@ const INSERT_IDS = new Set([
 ])
 
 const DEFAULT_CONFLICTS: Record<string, string[]> = {
-  auth_users: ["email"],
   profiles: ["id"],
   user_api_keys: ["user_id", "key_name"],
   runs: ["id"],

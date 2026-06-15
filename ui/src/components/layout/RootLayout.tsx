@@ -6,7 +6,7 @@ import { useAuth } from "../../hooks/useAuth"
 
 export function RootLayout() {
   const [showAuthModal, setShowAuthModal] = useState(false)
-  const { user, signIn, signUp, signOut } = useAuth()
+  const { user, signIn, signUp, signInWithOAuth, signOut } = useAuth()
 
   const userForNav = user
     ? {
@@ -43,6 +43,7 @@ export function RootLayout() {
         onClose={() => setShowAuthModal(false)}
         onSignIn={signIn}
         onSignUp={signUp}
+        onOAuthSignIn={signInWithOAuth}
       />
     </div>
   )
