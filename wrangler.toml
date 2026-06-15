@@ -10,10 +10,6 @@ workers_dev = false
 pattern = "observatory.zeroset.com"
 custom_domain = true
 
-[[routes]]
-pattern = "observatory.trynebula.ai"
-custom_domain = true
-
 [assets]
 directory = "./ui/dist"
 binding = "ASSETS"
@@ -57,7 +53,7 @@ head_sampling_rate = 1.0
 [vars]
 OBSERVATORY_ALLOWED_ORIGINS = "http://localhost:3003"
 SUPERMEMORY_BASE_URL = "https://api.supermemory.ai"
-NEBULA_BASE_URL = "https://api.trynebula.ai"
+NEBULA_BASE_URL = "https://api.zeroset.com"
 
 [env.staging]
 name = "observatory-staging"
@@ -65,10 +61,6 @@ workers_dev = false
 
 [[env.staging.routes]]
 pattern = "observatory-staging.zeroset.com"
-custom_domain = true
-
-[[env.staging.routes]]
-pattern = "observatory-staging.trynebula.ai"
 custom_domain = true
 
 [env.staging.triggers]
@@ -105,4 +97,4 @@ new_sqlite_classes = ["RunCoordinator", "ComparisonCoordinator"]
 [env.staging.vars]
 OBSERVATORY_ALLOWED_ORIGINS = "http://localhost:3003"
 SUPERMEMORY_BASE_URL = "https://api.supermemory.ai"
-NEBULA_BASE_URL = "https://api.trynebula.ai"
+NEBULA_BASE_URL = "https://api.zeroset.com"

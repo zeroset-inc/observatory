@@ -4,7 +4,7 @@
 
 Memory is becoming core infrastructure for AI agents, yet there is no standard way to measure it. Observatory provides reproducible, multi-dimensional benchmarks for memory providers — and publishes all results to a public leaderboard.
 
-**Leaderboard:** [observatory.trynebula.ai](https://observatory.trynebula.ai)
+**Leaderboard:** [observatory.zeroset.com](https://observatory.zeroset.com)
 
 ---
 
@@ -66,7 +66,7 @@ Any memory system with a retrieval API can be evaluated. Built-in integrations:
 | Provider | Architecture |
 |----------|-------------|
 | [Mem0](https://mem0.ai) | Memory graph |
-| [Nebula](https://trynebula.ai) | Hybrid retrieval |
+| [Nebula](https://zeroset.com) | Hybrid retrieval |
 | [Supermemory](https://supermemory.ai) | Vector retrieval |
 | [Zep](https://getzep.com) | Graph-based memory |
 
@@ -103,7 +103,7 @@ bun dev
 
 Add your API keys — at least one memory provider key and one LLM judge key.
 
-- **Hosted** ([observatory.trynebula.ai](https://observatory.trynebula.ai)): Open **Settings** in the sidebar. Keys are encrypted per-user in Cloudflare D1 and persist across runs.
+- **Hosted** ([observatory.zeroset.com](https://observatory.zeroset.com)): Open **Settings** in the sidebar. Keys are encrypted per-user in Cloudflare D1 and persist across runs.
 - **Self-hosted Worker**: copy `.env.example` to `.dev.vars` for local Wrangler development, or set production secrets with `wrangler secret put`:
 
 ```bash
@@ -128,22 +128,11 @@ OBSERVATORY_ALLOWED_ORIGINS=http://localhost:3003
 Deployments are owned by Cloudflare Workers now. The Worker is bound to custom domains:
 
 - Production: `observatory.zeroset.com`
-- Production alias: `observatory.trynebula.ai`
 - Staging: `observatory-staging.zeroset.com`
-- Staging alias: `observatory-staging.trynebula.ai`
 
-Before the first deploy, provision Cloudflare resources:
+The Observatory deploy workflow bootstraps Cloudflare resources automatically: it resolves or creates the target D1 database by name, injects the database ID into `wrangler.toml`, creates the target Queue if missing, applies D1 migrations, syncs Worker secrets, and deploys the selected Worker environment.
 
-```bash
-# Production D1 (`observatory`) is Terraform-managed in the Nebula repo.
-wrangler d1 create observatory-staging
-wrangler queues create observatory-runner
-wrangler queues create observatory-runner-staging
-```
-
-The Observatory deploy workflow resolves D1 IDs by database name and injects them into `wrangler.toml` at deploy time.
-
-Set GitHub Actions configuration in `zeroset-inc/observatory`:
+One-time GitHub Actions configuration in `zeroset-inc/observatory`:
 
 ```bash
 gh variable set CLOUDFLARE_ACCOUNT_ID --repo zeroset-inc/observatory --body <account-id>
@@ -153,9 +142,9 @@ gh secret set OBSERVATORY_SECRET --repo zeroset-inc/observatory
 
 The Cloudflare token should be Observatory-specific and scoped to the target account/zones with Workers, D1, Queues, and Worker custom-domain/route permissions.
 
-Apply migrations with `bun run db:migrate:remote`, then deploy production with `bun run deploy`. Use the GitHub workflow dispatch target `staging` for staging deploys.
+Pushes to `main` deploy production. Use the GitHub workflow dispatch target `staging` for staging deploys.
 
-Custom-domain cutover requires removing or replacing any previous ingress/DNS ownership for the same `observatory*.zeroset.com` and `observatory*.trynebula.ai` hostnames so Cloudflare Workers can own those hostnames.
+Custom-domain cutover requires removing or replacing any previous ingress/DNS ownership for the same `observatory*.zeroset.com` hostnames so Cloudflare Workers can own them.
 
 Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles.
 
@@ -194,7 +183,7 @@ Contributions welcome — new benchmarks, provider integrations, scoring improve
 
 ## Maintainers
 
-Built by the team at [Nebula](https://trynebula.ai).
+Built by the team at [Nebula](https://zeroset.com).
 
 ## License
 

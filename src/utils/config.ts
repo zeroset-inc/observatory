@@ -12,7 +12,7 @@ export interface Config {
   nebulaBaseUrl: string
 }
 
-const nebulaBaseUrl = getEnvValue("NEBULA_BASE_URL") || "https://api.trynebula.ai"
+const nebulaBaseUrl = getEnvValue("NEBULA_BASE_URL") || "https://api.zeroset.com"
 
 export const config: Config = {
   supermemoryApiKey: getEnvValue("SUPERMEMORY_API_KEY") || "",
