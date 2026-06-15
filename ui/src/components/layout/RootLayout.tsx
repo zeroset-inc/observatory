@@ -33,7 +33,7 @@ export function RootLayout() {
           rel="noopener noreferrer"
           className="text-text-secondary hover:text-text-primary transition-colors"
         >
-          Nebula
+          Zeroset
         </a>
         {" \u00B7 "} Memory for AI agents
       </footer>

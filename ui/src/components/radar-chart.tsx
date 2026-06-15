@@ -14,7 +14,7 @@ interface RadarChartProps {
 }
 
 const PROVIDER_COLORS: Record<string, string> = {
-  nebula: "#5040ff",
+  nebula: "#5b5fd6",
   supermemory: "#60a5fa",
 }
 
