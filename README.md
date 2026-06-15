@@ -113,6 +113,7 @@ wrangler secret put OBSERVATORY_SECRET
 # Memory providers (at least one)
 MEM0_API_KEY=
 NEBULA_API_KEY=
+NEBULA_BASE_URL=https://api.zeroset.com
 SUPERMEMORY_API_KEY=
 ZEP_API_KEY=
 
@@ -152,7 +153,7 @@ Run `Bootstrap Cloudflare Observatory` once per environment, or when repairing C
 
 Custom-domain cutover is handled by the bootstrap workflow for exact `observatory*.zeroset.com` DNS records when `cutover_dns` is enabled.
 
-Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles.
+Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, Nebula-backed user auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles. Observatory stores local profile projections and encrypted provider keys in D1, but signup, login, Google/GitHub OAuth, logout, and session validation are owned by the main Nebula auth service.
 
 If your UI runs on a different origin than the API, add that origin to `OBSERVATORY_ALLOWED_ORIGINS`. The server only sends `Access-Control-Allow-Origin` for allowlisted origins.
 

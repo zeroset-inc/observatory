@@ -8,9 +8,11 @@ import {
 } from "../services/apiKeys"
 import { clearSessionCookie, getSessionIdFromRequest, setSessionCookie } from "../sessionCookie"
 import { db } from "../db"
-
-const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30
-const PBKDF2_ITERATIONS = 210_000
+import {
+  extractNebulaSessionCookie,
+  nebulaApiUrl,
+  nebulaSessionCookieHeader,
+} from "../services/nebulaAuth"
 
 function json(data: unknown, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(data), {
@@ -23,67 +25,20 @@ function normalizeEmail(email: string): string {
   return email.trim().toLowerCase()
 }
 
-function bytesToBase64(bytes: ArrayBuffer | Uint8Array): string {
-  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
-  let binary = ""
-  for (const byte of view) binary += String.fromCharCode(byte)
-  return btoa(binary)
+async function readNebulaJson(resp: Response): Promise<any> {
+  return resp.json().catch(() => ({}))
 }
 
-function base64ToBytes(value: string): Uint8Array {
-  const binary = atob(value)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-  return bytes
+function nebulaError(data: any, fallback: string): string {
+  return data?.detail ?? data?.message ?? data?.error ?? fallback
 }
 
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
-}
-
-async function hashPassword(password: string, salt?: Uint8Array): Promise<{ salt: string; hash: string }> {
-  const passwordSalt = salt ?? crypto.getRandomValues(new Uint8Array(16))
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"]
-  )
-  const hash = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      hash: "SHA-256",
-      salt: toArrayBuffer(passwordSalt),
-      iterations: PBKDF2_ITERATIONS,
-    },
-    key,
-    256
-  )
-  return { salt: bytesToBase64(passwordSalt), hash: bytesToBase64(hash) }
-}
-
-function timingSafeEqual(a: string, b: string): boolean {
-  const left = base64ToBytes(a)
-  const right = base64ToBytes(b)
-  if (left.length !== right.length) return false
-  let diff = 0
-  for (let i = 0; i < left.length; i++) diff |= left[i] ^ right[i]
-  return diff === 0
-}
-
-async function createSession(userId: string, email: string): Promise<{ id: string; expiresAt: string }> {
-  const sessionId = crypto.randomUUID()
-  const expiresAt = new Date(Date.now() + SESSION_MAX_AGE_SECONDS * 1000).toISOString()
-  const { error } = await db.from("auth_sessions").insert({
-    id: sessionId,
-    user_id: userId,
-    email,
-    expires_at: expiresAt,
-    created_at: new Date().toISOString(),
-  })
-  if (error) throw new Error(error.message)
-  return { id: sessionId, expiresAt }
+function responseWithNebulaSession(req: Request, resp: Response, body: unknown): Response {
+  const session = extractNebulaSessionCookie(resp.headers)
+  if (!session?.value) return json({ error: "Nebula did not return a session" }, 502)
+  const headers = new Headers({ "Content-Type": "application/json" })
+  setSessionCookie(headers, req, session.value, session.maxAge)
+  return new Response(JSON.stringify(body), { status: 200, headers })
 }
 
 export async function handleAuthRoutes(req: Request, url: URL): Promise<Response | null> {
@@ -100,43 +55,51 @@ export async function handleAuthRoutes(req: Request, url: URL): Promise<Response
       if (!email || !password) return json({ error: "Email and password are required" }, 400)
       if (password.length < 8) return json({ error: "Password must be at least 8 characters" }, 400)
 
-      const existing = await db.from("auth_users").select("id").eq("email", email).single()
-      if (existing.data) return json({ error: "An account with that email already exists" }, 409)
-
-      const userId = crypto.randomUUID()
-      const { salt, hash } = await hashPassword(password)
-      const now = new Date().toISOString()
-      const { error: userError } = await db.from("auth_users").insert({
-        id: userId,
-        email,
-        password_salt: salt,
-        password_hash: hash,
-        created_at: now,
-        updated_at: now,
+      const resp = await fetch(nebulaApiUrl("/users/register"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email,
+          password,
+          name: displayName || email.split("@")[0],
+        }),
       })
-      if (userError) return json({ error: userError.message }, 500)
 
-      const { error: profileError } = await db.from("profiles").insert({
-        id: userId,
-        display_name: displayName || email.split("@")[0],
-        email,
-        avatar_url: null,
-        created_at: now,
-        updated_at: now,
+      const data = await readNebulaJson(resp)
+      if (!resp.ok) return json({ error: nebulaError(data, "Signup failed") }, resp.status)
+      const result = data.results ?? data
+      return json({
+        message: result.message ?? "Account created. Check your email to verify your account.",
+        needsVerification:
+          result.next_step === "verify_email" || result.verification_email_sent !== false,
+        nextStep: result.next_step ?? "verify_email",
+        verificationEmailSent: Boolean(result.verification_email_sent ?? true),
       })
-      if (profileError) {
-        await db.from("auth_users").delete().eq("id", userId)
-        return json({ error: profileError.message }, 500)
-      }
-
-      return json({ message: "Account created. You can now sign in.", needsVerification: false })
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : "Invalid request" }, 400)
     }
   }
 
   if (method === "POST" && pathname === "/api/auth/verify-email") {
-    return json({ message: "Email verification is not required for this deployment." })
+    try {
+      const body = (await req.json()) as Record<string, any>
+      const email = normalizeEmail(body.email || "")
+      const verificationCode = String(body.verificationCode || body.verification_code || "")
+      if (!email || !verificationCode)
+        return json({ error: "Email and verification code are required" }, 400)
+
+      const resp = await fetch(nebulaApiUrl("/users/verify-email"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, verification_code: verificationCode }),
+      })
+      const data = await readNebulaJson(resp)
+      if (!resp.ok)
+        return json({ error: data.detail ?? data.message ?? "Verification failed" }, resp.status)
+      return json(data.results ?? data)
+    } catch (e) {
+      return json({ error: e instanceof Error ? e.message : "Invalid request" }, 400)
+    }
   }
 
   if (method === "POST" && pathname === "/api/auth/login") {
@@ -146,36 +109,51 @@ export async function handleAuthRoutes(req: Request, url: URL): Promise<Response
       const password = String(body.password || "")
       if (!email || !password) return json({ error: "Email and password are required" }, 400)
 
-      const { data: user } = await db
-        .from<{ id: string; email: string; password_salt: string; password_hash: string }>("auth_users")
-        .select("id, email, password_salt, password_hash")
-        .eq("email", email)
-        .single()
+      const resp = await fetch(nebulaApiUrl("/users/session/login"), {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ username: email, password }).toString(),
+      })
 
-      if (!user) return json({ error: "Invalid email or password" }, 401)
-
-      const candidate = await hashPassword(password, base64ToBytes(user.password_salt))
-      if (!timingSafeEqual(candidate.hash, user.password_hash)) {
-        return json({ error: "Invalid email or password" }, 401)
-      }
-
-      const session = await createSession(user.id, user.email)
-      const headers = new Headers({ "Content-Type": "application/json" })
-      setSessionCookie(headers, req, session.id, SESSION_MAX_AGE_SECONDS)
-      return new Response(JSON.stringify({ message: "Logged in" }), { status: 200, headers })
+      const data = await readNebulaJson(resp)
+      if (!resp.ok)
+        return json({ error: data.detail ?? data.message ?? "Login failed" }, resp.status)
+      return responseWithNebulaSession(req, resp, data.results ?? data)
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : "Invalid request" }, 400)
     }
   }
 
   if (method === "POST" && pathname === "/api/auth/oauth/exchange") {
-    return json({ error: "OAuth sign-in is not configured for the Cloudflare Worker deployment" }, 410)
+    try {
+      const body = (await req.json()) as Record<string, any>
+      const code = String(body.code || "")
+      if (!code) return json({ error: "Missing OAuth code" }, 400)
+
+      const resp = await fetch(nebulaApiUrl("/users/session/oauth/exchange"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+      })
+      const data = await readNebulaJson(resp)
+      if (!resp.ok)
+        return json({ error: data.detail ?? data.message ?? "OAuth exchange failed" }, resp.status)
+      return responseWithNebulaSession(req, resp, data.results ?? data)
+    } catch (e) {
+      return json({ error: e instanceof Error ? e.message : "Invalid request" }, 400)
+    }
   }
 
   if (method === "POST" && pathname === "/api/auth/logout") {
     const sessionId = getSessionIdFromRequest(req)
     if (sessionId) {
-      await db.from("auth_sessions").delete().eq("id", sessionId)
+      await fetch(nebulaApiUrl("/users/logout"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: nebulaSessionCookieHeader(sessionId),
+        },
+      }).catch(() => null)
     }
     const headers = new Headers({ "Content-Type": "application/json" })
     clearSessionCookie(headers, req)
@@ -185,12 +163,12 @@ export async function handleAuthRoutes(req: Request, url: URL): Promise<Response
   if (method === "GET" && pathname === "/api/auth/session") {
     try {
       const user = await requireAuth(req)
-      const { data: profile } = await db.from<any>("profiles").select("*").eq("id", user.id).single()
       return json({
         id: user.id,
         email: user.email,
-        displayName: profile?.display_name || user.email.split("@")[0],
-        avatarUrl: profile?.avatar_url || null,
+        displayName: user.displayName || user.email.split("@")[0],
+        avatarUrl: user.avatarUrl || null,
+        nebulaUserId: user.nebulaUserId,
         active: true,
       })
     } catch (e) {
@@ -233,7 +211,9 @@ export async function handleAuthRoutes(req: Request, url: URL): Promise<Response
       const keyName = decodeURIComponent(keySetMatch[1])
       if (!isValidKeyName(keyName)) {
         return json(
-          { error: `Invalid key name: ${keyName}. Valid: supermemory, mem0, zep, nebula, openai, anthropic, google` },
+          {
+            error: `Invalid key name: ${keyName}. Valid: supermemory, mem0, zep, nebula, openai, anthropic, google`,
+          },
           400
         )
       }
