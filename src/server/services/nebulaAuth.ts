@@ -4,8 +4,6 @@ import { config } from "../../utils/config"
 
 const NEBULA_SESSION_COOKIE = "nebula_session"
 
-export type NebulaOAuthProvider = "github" | "google"
-
 export type NebulaIdentity = {
   id: string
   email: string
@@ -13,7 +11,7 @@ export type NebulaIdentity = {
   avatarUrl: string | null
 }
 
-export type LocalProfile = {
+type LocalProfile = {
   id: string
   email: string
   display_name: string
@@ -43,7 +41,7 @@ export function nebulaSessionCookieHeader(sessionId: string): string {
   return `${NEBULA_SESSION_COOKIE}=${encodeURIComponent(sessionId)}`
 }
 
-export async function parseNebulaError(resp: Response, fallback: string): Promise<string> {
+async function parseNebulaError(resp: Response, fallback: string): Promise<string> {
   try {
     const body = (await resp.json()) as any
     return body?.detail ?? body?.message ?? body?.error ?? fallback
