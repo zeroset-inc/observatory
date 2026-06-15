@@ -130,21 +130,27 @@ Deployments are owned by Cloudflare Workers now. The Worker is bound to custom d
 - Production: `observatory.zeroset.com`
 - Staging: `observatory-staging.zeroset.com`
 
-The Observatory deploy workflow bootstraps Cloudflare resources automatically: it resolves or creates the target D1 database by name, injects the database ID into `wrangler.toml`, creates the target Queue if missing, applies D1 migrations, syncs Worker secrets, and deploys the selected Worker environment.
+Cloudflare setup and deployment are automated through GitHub Actions:
+
+- `Bootstrap Cloudflare Observatory` is a manual setup/repair workflow. It resolves or creates the target D1 database by name, injects the database ID into `wrangler.toml`, creates the target Queue if missing, applies D1 migrations, syncs Worker secrets, optionally removes conflicting DNS records, and deploys the selected Worker environment.
+- `Deploy Observatory Worker` is the routine deploy workflow. It runs automatically for production on pushes to `main`, and can be manually dispatched for staging. It resolves existing resources, applies migrations, syncs Worker secrets, and deploys the Worker without mutating DNS or creating infrastructure.
 
 One-time GitHub Actions configuration in `zeroset-inc/observatory`:
 
 ```bash
 gh variable set CLOUDFLARE_ACCOUNT_ID --repo zeroset-inc/observatory --body <account-id>
+gh secret set CLOUDFLARE_BOOTSTRAP_API_TOKEN --repo zeroset-inc/observatory
 gh secret set CLOUDFLARE_API_TOKEN --repo zeroset-inc/observatory
 gh secret set OBSERVATORY_SECRET --repo zeroset-inc/observatory
 ```
 
-The Cloudflare token should be Observatory-specific and scoped to the target account/zones with Workers, D1, Queues, Worker custom-domain/route permissions, and `zeroset.com` Zone DNS Read/Edit. DNS access is required so the deploy workflow can automatically remove old ingress records before assigning the Worker custom domain.
+`CLOUDFLARE_BOOTSTRAP_API_TOKEN` should be Observatory-specific and scoped to the target account/zones with Workers, D1, Queues, Worker custom-domain/route permissions, and `zeroset.com` Zone DNS Read/Edit. DNS access is required only for bootstrap-time cutover so the workflow can replace old ingress records before assigning the Worker custom domain.
 
-Pushes to `main` deploy production. Use the GitHub workflow dispatch target `staging` for staging deploys.
+`CLOUDFLARE_API_TOKEN` is the narrower routine deploy token. It needs enough account permissions to list the existing D1 database and Queue, apply D1 migrations, sync Worker secrets, and deploy the Worker, but it does not need zone DNS edit.
 
-Custom-domain cutover is handled by the deploy workflow for exact `observatory*.zeroset.com` DNS records when the token has the DNS scopes above.
+Run `Bootstrap Cloudflare Observatory` once per environment, or when repairing Cloudflare resources. Pushes to `main` deploy production. Use the `Deploy Observatory Worker` workflow dispatch target `staging` for staging deploys.
+
+Custom-domain cutover is handled by the bootstrap workflow for exact `observatory*.zeroset.com` DNS records when `cutover_dns` is enabled.
 
 Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles.
 

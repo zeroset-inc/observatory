@@ -52,7 +52,6 @@ jobs:
               echo "database_name=observatory-staging"
               echo "database_placeholder=REPLACE_WITH_OBSERVATORY_STAGING_D1_DATABASE_ID"
               echo "queue_name=observatory-runner-staging"
-              echo "domain_name=observatory-staging.zeroset.com"
             } >> "$GITHUB_OUTPUT"
           else
             {
@@ -60,14 +59,13 @@ jobs:
               echo "database_name=observatory"
               echo "database_placeholder=REPLACE_WITH_OBSERVATORY_D1_DATABASE_ID"
               echo "queue_name=observatory-runner"
-              echo "domain_name=observatory.zeroset.com"
             } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Resolve D1 database id and inject into wrangler.toml
-        # Resolve the target D1 database by name and create it if it does not
-        # exist yet. Then inject the resolved UUID into wrangler.toml so the
-        # committed config can stay environment-agnostic.
+        # Resolve the target D1 database by name and inject the resolved UUID
+        # into wrangler.toml so the committed config can stay environment-agnostic.
+        # Resource creation is intentionally owned by the bootstrap workflow.
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -80,17 +78,13 @@ jobs:
           fi
           id=$(bunx wrangler d1 list --json | jq -r --arg name "$DATABASE_NAME" '.[] | select(.name == $name) | (.uuid // .id)')
           if [ -z "$id" ] || [ "$id" = "null" ]; then
-            bunx wrangler d1 create "$DATABASE_NAME" --location enam
-            id=$(bunx wrangler d1 list --json | jq -r --arg name "$DATABASE_NAME" '.[] | select(.name == $name) | (.uuid // .id)')
-          fi
-          if [ -z "$id" ] || [ "$id" = "null" ]; then
-            echo "::error::D1 database '$DATABASE_NAME' could not be created or resolved." >&2
+            echo "::error::D1 database '$DATABASE_NAME' was not found. Run the Bootstrap Cloudflare Observatory workflow for this environment first." >&2
             exit 1
           fi
           sed -i "s|${DATABASE_PLACEHOLDER}|${id}|" wrangler.toml
           echo "Resolved D1 '$DATABASE_NAME' id and injected into wrangler.toml."
 
-      - name: Ensure Queue exists
+      - name: Verify Queue exists
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -98,7 +92,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! bunx wrangler queues list | grep -E "(^|[[:space:]])${QUEUE_NAME}([[:space:]]|$)"; then
-            bunx wrangler queues create "$QUEUE_NAME"
+            echo "::error::Queue '$QUEUE_NAME' was not found. Run the Bootstrap Cloudflare Observatory workflow for this environment first." >&2
+            exit 1
           fi
 
       - name: Apply D1 migrations
@@ -131,63 +126,6 @@ jobs:
           else
             printf "%s" "$OBSERVATORY_SECRET" | bunx wrangler secret put OBSERVATORY_SECRET
           fi
-
-      - name: Remove conflicting DNS records for Worker custom domain
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          DOMAIN_NAME: ${{ steps.target.outputs.domain_name }}
-        run: |
-          set -euo pipefail
-          node <<'NODE'
-          const token = process.env.CLOUDFLARE_API_TOKEN
-          const domainName = process.env.DOMAIN_NAME
-          const zoneName = "zeroset.com"
-
-          async function cloudflare(path, init = {}) {
-            const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
-              ...init,
-              headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "application/json",
-                ...(init.headers ?? {}),
-              },
-            })
-            const body = await response.json().catch(() => ({}))
-            if (!response.ok || body.success === false) {
-              const details = JSON.stringify(body.errors ?? body)
-              throw new Error(`Cloudflare API ${init.method ?? "GET"} ${path} failed: ${details}`)
-            }
-            return body.result
-          }
-
-          const zones = await cloudflare(`/zones?name=${encodeURIComponent(zoneName)}`)
-          const zone = zones?.[0]
-          if (!zone?.id) {
-            throw new Error(`Cloudflare zone '${zoneName}' was not found or token cannot read zones.`)
-          }
-
-          let records
-          try {
-            records = await cloudflare(
-              `/zones/${zone.id}/dns_records?name=${encodeURIComponent(domainName)}`
-            )
-          } catch (error) {
-            throw new Error(
-              `${error.message}. The Observatory deploy token needs Zone DNS Read/Edit for ${zoneName} so the workflow can replace old ingress DNS with the Worker custom domain.`
-            )
-          }
-
-          const conflicting = (records ?? []).filter((record) =>
-            ["A", "AAAA", "CNAME"].includes(record.type)
-          )
-          for (const record of conflicting) {
-            await cloudflare(`/zones/${zone.id}/dns_records/${record.id}`, { method: "DELETE" })
-            console.log(`Deleted conflicting ${record.type} DNS record for ${record.name}.`)
-          }
-          if (conflicting.length === 0) {
-            console.log(`No conflicting DNS records found for ${domainName}.`)
-          }
-          NODE
 
       - name: Deploy Worker
         env:
