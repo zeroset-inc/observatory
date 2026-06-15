@@ -10,6 +10,7 @@ import type { ProviderName } from "../../types/provider"
 import type { BenchmarkName } from "../../types/benchmark"
 import type { PhaseId } from "../../types/checkpoint"
 import { PHASE_ORDER } from "../../types/checkpoint"
+import { getRunQuestion, listRunQuestions } from "../../repositories/d1/runQuestions"
 import {
   beginRunDelete,
   durableRunnerAvailable,
@@ -202,44 +203,27 @@ export async function handleRunsRoutes(
     const user = await optionalAuth(req)
     const visError = await verifyRunVisibility(runId, user)
     if (visError) return visError
-    const checkpoint = await checkpointManager.load(runId)
-    if (!checkpoint) {
-      return json({ error: "Run not found" }, 404)
-    }
-
-    const page = parseInt(url.searchParams.get("page") || "1")
-    const limit = parseInt(url.searchParams.get("limit") || "50")
+    const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10) || 1)
+    const limit = Math.min(
+      500,
+      Math.max(1, parseInt(url.searchParams.get("limit") || "50", 10) || 50)
+    )
     const status = url.searchParams.get("status")
     const type = url.searchParams.get("type")
 
-    let questions = Object.values(checkpoint.questions)
-
-    if (status) {
-      questions = questions.filter((q) => {
-        const evalStatus = q.phases.evaluate.status
-        if (status === "completed") return evalStatus === "completed"
-        if (status === "failed") return evalStatus === "failed"
-        if (status === "pending") return evalStatus !== "completed" && evalStatus !== "failed"
-        return true
-      })
+    const result = await listRunQuestions({ runId, page, limit, status, type })
+    if (!result) {
+      return json({ error: "Run not found" }, 404)
     }
-
-    if (type) {
-      questions = questions.filter((q) => q.questionType === type)
-    }
-
-    const total = questions.length
-    const start = (page - 1) * limit
-    const paged = questions.slice(start, start + limit)
 
     return json({
-      questions: paged,
-      questionTypeRegistry: getQuestionTypeRegistry(checkpoint.benchmark),
+      questions: result.questions,
+      questionTypeRegistry: getQuestionTypeRegistry(result.benchmark),
       pagination: {
         page,
         limit,
-        total,
-        totalPages: Math.ceil(total / limit),
+        total: result.total,
+        totalPages: Math.ceil(result.total / limit),
       },
     })
   }
@@ -252,11 +236,7 @@ export async function handleRunsRoutes(
     const visError = await verifyRunVisibility(runId, user)
     if (visError) return visError
     const questionId = decodeURIComponent(questionDetailMatch[2])
-    const checkpoint = await checkpointManager.load(runId)
-    if (!checkpoint) {
-      return json({ error: "Run not found" }, 404)
-    }
-    const question = checkpoint.questions[questionId]
+    const question = await getRunQuestion(runId, questionId)
     if (!question) {
       return json({ error: "Question not found" }, 404)
     }

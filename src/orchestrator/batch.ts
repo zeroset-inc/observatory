@@ -5,10 +5,8 @@ import type { BenchmarkResult } from "../types/unified"
 import { orchestrator } from "./index"
 import { createBenchmark } from "../benchmarks"
 import { logger } from "../utils/logger"
-import { startRun, endRun, requestStop } from "../server/runState"
 
 const COMPARE_LEASE_TTL_MS = 24 * 60 * 60 * 1000
-const COMPARE_LEASE_RENEW_MS = 10 * 60 * 1000
 
 function getDb() {
   const { db } = require("../server/db")
@@ -37,9 +35,7 @@ export interface CompareOptions {
   benchmark: BenchmarkName
   judgeModel: string
   userId?: string | null
-  userKeys?: Record<string, string>
   sampling?: SamplingConfig
-  force?: boolean
 }
 
 export interface CompareResult {
@@ -181,63 +177,6 @@ export class BatchManager {
     return new Date(manifest.activeLeaseExpiresAt).getTime() > Date.now()
   }
 
-  private startComparisonLeaseMaintenance(
-    manifest: CompareManifest,
-    leaseToken?: string
-  ): () => void {
-    let stopped = false
-    let polling = false
-    let nextRenewAt = Date.now() + COMPARE_LEASE_RENEW_MS
-    const poll = async () => {
-      if (stopped || polling) return
-      polling = true
-      try {
-        if (leaseToken && Date.now() >= nextRenewAt) {
-          const renewed = await this.renewComparisonLease(manifest.compareId, leaseToken)
-          nextRenewAt = Date.now() + COMPARE_LEASE_RENEW_MS
-          if (!renewed) {
-            logger.warn(`Lost comparison lease ${manifest.compareId}; stopping child runs`)
-            for (const run of manifest.runs) {
-              requestStop(run.runId)
-            }
-            return
-          }
-        }
-
-        const db = this.getDb()
-        const { data, error } = await db
-          .from("comparisons")
-          .select("active_status")
-          .eq("id", manifest.compareId)
-          .maybeSingle()
-
-        if (!error && data?.active_status === "stopping") {
-          for (const run of manifest.runs) {
-            requestStop(run.runId)
-          }
-        }
-      } catch (error) {
-        logger.warn(
-          `Failed to poll comparison stop state ${manifest.compareId}: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        )
-      } finally {
-        polling = false
-      }
-    }
-
-    const interval = setInterval(() => {
-      void poll()
-    }, 2000)
-    void poll()
-
-    return () => {
-      stopped = true
-      clearInterval(interval)
-    }
-  }
-
   async saveManifest(manifest: CompareManifest): Promise<void> {
     manifest.updatedAt = new Date().toISOString()
 
@@ -364,11 +303,6 @@ export class BatchManager {
     return data.report_data as BenchmarkResult
   }
 
-  async compare(options: CompareOptions): Promise<CompareResult> {
-    const manifest = await this.createManifest(options)
-    return this.executeRunsWithLease(manifest, options.userKeys)
-  }
-
   async createManifest(options: CompareOptions): Promise<CompareManifest> {
     const { providers, benchmark, judgeModel, sampling, userId } = options
     const compareId = generateCompareId()
@@ -406,116 +340,6 @@ export class BatchManager {
     logger.info(`Questions: ${targetQuestionIds.length}`)
 
     return manifest
-  }
-
-  async resume(
-    compareId: string,
-    force?: boolean,
-    userKeys?: Record<string, string>
-  ): Promise<CompareResult> {
-    if (force) {
-      await this.delete(compareId)
-      throw new Error(`Comparison ${compareId} deleted with --force. Start a new comparison.`)
-    }
-
-    const manifest = await this.loadManifestAsync(compareId)
-    if (!manifest) {
-      throw new Error(`Comparison not found: ${compareId}`)
-    }
-
-    logger.info(`Resuming comparison: ${manifest.compareId}`)
-    return this.executeRunsWithLease(manifest, userKeys)
-  }
-
-  async executeRunsWithLease(
-    manifest: CompareManifest,
-    userKeys?: Record<string, string>
-  ): Promise<CompareResult> {
-    const leaseToken = await this.acquireComparisonLease(manifest.compareId)
-    if (!leaseToken) {
-      throw new Error(`Comparison is already active: ${manifest.compareId}`)
-    }
-
-    try {
-      return await this.executeRuns(manifest, userKeys, leaseToken)
-    } finally {
-      await this.releaseComparisonLease(manifest.compareId, leaseToken)
-    }
-  }
-
-  async executeRuns(
-    manifest: CompareManifest,
-    userKeys?: Record<string, string>,
-    leaseToken?: string
-  ): Promise<CompareResult> {
-    logger.info(`Starting ${manifest.runs.length} parallel runs...`)
-
-    // Register all runs in activeRuns before starting
-    for (const run of manifest.runs) {
-      startRun(run.runId, manifest.benchmark, manifest.userId)
-    }
-
-    const checkpointManager = orchestrator.getCheckpointManager()
-    const stopPolling = this.startComparisonLeaseMaintenance(manifest, leaseToken)
-
-    let results: PromiseSettledResult<void>[]
-    try {
-      results = await Promise.allSettled(
-        manifest.runs.map(async (run) => {
-          try {
-            return await orchestrator.run({
-              provider: run.provider as ProviderName,
-              benchmark: manifest.benchmark as BenchmarkName,
-              judgeModel: manifest.judge,
-              runId: run.runId,
-              userId: manifest.userId,
-              userKeys,
-              questionIds: manifest.targetQuestionIds,
-            })
-          } catch (error) {
-            // Update checkpoint status to persist the failure state
-            await checkpointManager.flush(run.runId)
-            const checkpoint = await checkpointManager.load(run.runId)
-            if (checkpoint) {
-              checkpointManager.updateStatus(checkpoint, "failed")
-              await checkpointManager.flush(run.runId)
-            }
-            throw error
-          } finally {
-            // Always unregister the run when done (success or failure)
-            endRun(run.runId)
-          }
-        })
-      )
-    } finally {
-      stopPolling()
-    }
-
-    const failures = results.filter((r) => r.status === "rejected")
-    const successes = results.filter((r) => r.status === "fulfilled").length
-
-    if (failures.length > 0) {
-      logger.warn(`${failures.length} run(s) failed`)
-      for (let i = 0; i < results.length; i++) {
-        const result = results[i]
-        if (result.status === "rejected") {
-          logger.error(`  ${manifest.runs[i].provider}: ${result.reason}`)
-        }
-      }
-    }
-
-    if (successes > 0) {
-      logger.success(`${successes} run(s) completed successfully`)
-    }
-
-    await this.saveManifest(manifest)
-
-    return {
-      compareId: manifest.compareId,
-      manifest,
-      successes,
-      failures: failures.length,
-    }
   }
 
   async getReports(manifest: CompareManifest): Promise<Array<{ provider: string; report: BenchmarkResult }>> {

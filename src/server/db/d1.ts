@@ -479,6 +479,17 @@ export class D1Client {
     assertD1BindingLimit("raw", "run", bindings)
     return this.db.prepare(sql).bind(...bindings.map(serializeValue)).run()
   }
+
+  async all<T = Record<string, any>>(sql: string, bindings: unknown[] = []): Promise<T[]> {
+    assertD1BindingLimit("raw", "select", bindings)
+    const result = await this.db.prepare(sql).bind(...bindings.map(serializeValue)).all<T>()
+    return result.results ?? []
+  }
+
+  async first<T = Record<string, any>>(sql: string, bindings: unknown[] = []): Promise<T | null> {
+    assertD1BindingLimit("raw", "select", bindings)
+    return (await this.db.prepare(sql).bind(...bindings.map(serializeValue)).first<T>()) ?? null
+  }
 }
 
 export function getD1Client(): D1Client {
@@ -491,5 +502,11 @@ export const db = {
   },
   run(sql: string, bindings: unknown[] = []): Promise<D1Result> {
     return getD1Client().run(sql, bindings)
+  },
+  all<T = Record<string, any>>(sql: string, bindings: unknown[] = []): Promise<T[]> {
+    return getD1Client().all<T>(sql, bindings)
+  },
+  first<T = Record<string, any>>(sql: string, bindings: unknown[] = []): Promise<T | null> {
+    return getD1Client().first<T>(sql, bindings)
   },
 }

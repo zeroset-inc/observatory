@@ -3,6 +3,7 @@ import { setRuntimeEnv, type ObservatoryEnv } from "./server/runtime"
 import { executeRunnerTask } from "./runner/tasks/executor"
 import { RunnerTaskBusyError, RunnerTaskRetryableError } from "./runner/tasks/store"
 import type { RunnerTaskMessage } from "./runner/tasks/types"
+import { sweepRunner } from "./runner/sweeper"
 
 export { RunCoordinator, ComparisonCoordinator } from "./runner/durable"
 
@@ -186,5 +187,11 @@ export default {
         message.retry({ delaySeconds: RUNNER_QUEUE_RETRY_DELAY_SECONDS })
       }
     }
+  },
+
+  async scheduled(_event: ScheduledEvent, env: ObservatoryEnv, _ctx: ExecutionContext): Promise<void> {
+    setRuntimeEnv(env)
+    const result = await sweepRunner(env)
+    console.log("[worker.scheduled] Runner sweep complete:", result)
   },
 }

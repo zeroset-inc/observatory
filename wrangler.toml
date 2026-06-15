@@ -11,6 +11,9 @@ directory = "./ui/dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
 
+[triggers]
+crons = ["*/5 * * * *"]
+
 [[d1_databases]]
 binding = "OBSERVATORY_DB"
 database_name = "observatory"
