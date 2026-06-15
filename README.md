@@ -140,11 +140,11 @@ gh secret set CLOUDFLARE_API_TOKEN --repo zeroset-inc/observatory
 gh secret set OBSERVATORY_SECRET --repo zeroset-inc/observatory
 ```
 
-The Cloudflare token should be Observatory-specific and scoped to the target account/zones with Workers, D1, Queues, and Worker custom-domain/route permissions.
+The Cloudflare token should be Observatory-specific and scoped to the target account/zones with Workers, D1, Queues, Worker custom-domain/route permissions, and `zeroset.com` Zone DNS Read/Edit. DNS access is required so the deploy workflow can automatically remove old ingress records before assigning the Worker custom domain.
 
 Pushes to `main` deploy production. Use the GitHub workflow dispatch target `staging` for staging deploys.
 
-Custom-domain cutover requires removing or replacing any previous ingress/DNS ownership for the same `observatory*.zeroset.com` hostnames so Cloudflare Workers can own them.
+Custom-domain cutover is handled by the deploy workflow for exact `observatory*.zeroset.com` DNS records when the token has the DNS scopes above.
 
 Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles.
 
