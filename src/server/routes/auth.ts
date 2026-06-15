@@ -6,202 +6,186 @@ import {
   listUserApiKeyNames,
   isValidKeyName,
 } from "../services/apiKeys"
-import { config } from "../../utils/config"
-import {
-  clearSessionCookie,
-  extractSetCookie,
-  getSessionIdFromRequest,
-  setSessionCookie,
-} from "../sessionCookie"
+import { clearSessionCookie, getSessionIdFromRequest, setSessionCookie } from "../sessionCookie"
+import { db } from "../db"
 
-function json(data: unknown, status = 200): Response {
+const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30
+const PBKDF2_ITERATIONS = 210_000
+
+function json(data: unknown, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
   })
 }
 
-const NEBULA_API = `${config.nebulaBaseUrl}/v1`
-const DEFAULT_OAUTH_RETURN_URL = "/leaderboard"
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase()
+}
+
+function bytesToBase64(bytes: ArrayBuffer | Uint8Array): string {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+  let binary = ""
+  for (const byte of view) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+}
+
+async function hashPassword(password: string, salt?: Uint8Array): Promise<{ salt: string; hash: string }> {
+  const passwordSalt = salt ?? crypto.getRandomValues(new Uint8Array(16))
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  )
+  const hash = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: toArrayBuffer(passwordSalt),
+      iterations: PBKDF2_ITERATIONS,
+    },
+    key,
+    256
+  )
+  return { salt: bytesToBase64(passwordSalt), hash: bytesToBase64(hash) }
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const left = base64ToBytes(a)
+  const right = base64ToBytes(b)
+  if (left.length !== right.length) return false
+  let diff = 0
+  for (let i = 0; i < left.length; i++) diff |= left[i] ^ right[i]
+  return diff === 0
+}
+
+async function createSession(userId: string, email: string): Promise<{ id: string; expiresAt: string }> {
+  const sessionId = crypto.randomUUID()
+  const expiresAt = new Date(Date.now() + SESSION_MAX_AGE_SECONDS * 1000).toISOString()
+  const { error } = await db.from("auth_sessions").insert({
+    id: sessionId,
+    user_id: userId,
+    email,
+    expires_at: expiresAt,
+    created_at: new Date().toISOString(),
+  })
+  if (error) throw new Error(error.message)
+  return { id: sessionId, expiresAt }
+}
 
 export async function handleAuthRoutes(req: Request, url: URL): Promise<Response | null> {
   const method = req.method
   const pathname = url.pathname
 
-  const supabase = require("../db/supabase").supabase
-
-  // POST /api/auth/signup -- proxy to Nebula backend
   if (method === "POST" && pathname === "/api/auth/signup") {
     try {
-      const body = await req.json()
-      const { email, password, displayName } = body
+      const body = (await req.json()) as Record<string, any>
+      const email = normalizeEmail(body.email || "")
+      const password = String(body.password || "")
+      const displayName = String(body.displayName || email.split("@")[0])
 
-      if (!email || !password) {
-        return json({ error: "Email and password are required" }, 400)
+      if (!email || !password) return json({ error: "Email and password are required" }, 400)
+      if (password.length < 8) return json({ error: "Password must be at least 8 characters" }, 400)
+
+      const existing = await db.from("auth_users").select("id").eq("email", email).single()
+      if (existing.data) return json({ error: "An account with that email already exists" }, 409)
+
+      const userId = crypto.randomUUID()
+      const { salt, hash } = await hashPassword(password)
+      const now = new Date().toISOString()
+      const { error: userError } = await db.from("auth_users").insert({
+        id: userId,
+        email,
+        password_salt: salt,
+        password_hash: hash,
+        created_at: now,
+        updated_at: now,
+      })
+      if (userError) return json({ error: userError.message }, 500)
+
+      const { error: profileError } = await db.from("profiles").insert({
+        id: userId,
+        display_name: displayName || email.split("@")[0],
+        email,
+        avatar_url: null,
+        created_at: now,
+        updated_at: now,
+      })
+      if (profileError) {
+        await db.from("auth_users").delete().eq("id", userId)
+        return json({ error: profileError.message }, 500)
       }
 
-      const { captchaToken } = body
-      const resp = await fetch(`${NEBULA_API}/users/register`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password, name: displayName, captcha_token: captchaToken }),
-      })
-
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}))
-        return json({ error: err.detail || err.message || "Signup failed" }, resp.status)
-      }
-
-      return json({
-        message: "Account created. Please check your email for a verification code.",
-        needsVerification: true,
-      })
+      return json({ message: "Account created. You can now sign in.", needsVerification: false })
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : "Invalid request" }, 400)
     }
   }
 
-  // POST /api/auth/verify-email -- proxy to Nebula
   if (method === "POST" && pathname === "/api/auth/verify-email") {
-    try {
-      const body = await req.json()
-      const { email, verificationCode } = body
-
-      if (!email || !verificationCode) {
-        return json({ error: "Email and verification code are required" }, 400)
-      }
-
-      const resp = await fetch(`${NEBULA_API}/users/verify-email`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, verification_code: verificationCode }),
-      })
-
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}))
-        return json({ error: err.detail || err.message || "Verification failed" }, resp.status)
-      }
-
-      return json({ message: "Email verified! You can now sign in." })
-    } catch (e) {
-      return json({ error: e instanceof Error ? e.message : "Invalid request" }, 400)
-    }
+    return json({ message: "Email verification is not required for this deployment." })
   }
 
-  // POST /api/auth/login -- create an Observatory cookie session backed by Nebula
   if (method === "POST" && pathname === "/api/auth/login") {
     try {
-      const body = await req.json()
-      const { email, password } = body
+      const body = (await req.json()) as Record<string, any>
+      const email = normalizeEmail(body.email || "")
+      const password = String(body.password || "")
+      if (!email || !password) return json({ error: "Email and password are required" }, 400)
 
-      if (!email || !password) {
-        return json({ error: "Email and password are required" }, 400)
+      const { data: user } = await db
+        .from<{ id: string; email: string; password_salt: string; password_hash: string }>("auth_users")
+        .select("id, email, password_salt, password_hash")
+        .eq("email", email)
+        .single()
+
+      if (!user) return json({ error: "Invalid email or password" }, 401)
+
+      const candidate = await hashPassword(password, base64ToBytes(user.password_salt))
+      if (!timingSafeEqual(candidate.hash, user.password_hash)) {
+        return json({ error: "Invalid email or password" }, 401)
       }
 
-      const { captchaToken } = body
-      const params: Record<string, string> = { username: email, password }
-      if (captchaToken) params.captcha_token = captchaToken
-      const resp = await fetch(`${NEBULA_API}/users/session/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams(params).toString(),
-      })
-
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}))
-        return json({ error: err.detail || err.message || "Login failed" }, resp.status)
-      }
-
-      const sessionCookie = extractSetCookie(resp.headers, "nebula_session")
-      if (!sessionCookie?.value) {
-        return json({ error: "Login succeeded but no session cookie was returned" }, 502)
-      }
-
+      const session = await createSession(user.id, user.email)
       const headers = new Headers({ "Content-Type": "application/json" })
-      setSessionCookie(headers, req, sessionCookie.value, sessionCookie.maxAge)
-      return new Response(JSON.stringify({ message: "Logged in" }), {
-        status: 200,
-        headers,
-      })
+      setSessionCookie(headers, req, session.id, SESSION_MAX_AGE_SECONDS)
+      return new Response(JSON.stringify({ message: "Logged in" }), { status: 200, headers })
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : "Invalid request" }, 400)
     }
   }
 
-  // POST /api/auth/oauth/exchange -- exchange OAuth code into Observatory cookie session
   if (method === "POST" && pathname === "/api/auth/oauth/exchange") {
-    try {
-      const body = await req.json()
-      const { code } = body
-      if (!code) {
-        return json({ error: "Missing OAuth code" }, 400)
-      }
-
-      const resp = await fetch(`${NEBULA_API}/users/session/oauth/exchange`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
-      })
-
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => null)
-        return json(
-          { error: data?.detail || data?.message || "OAuth exchange failed" },
-          resp.status
-        )
-      }
-
-      const sessionCookie = extractSetCookie(resp.headers, "nebula_session")
-      if (!sessionCookie?.value) {
-        return json({ error: "OAuth exchange succeeded but no session cookie was returned" }, 502)
-      }
-
-      const headers = new Headers({ "Content-Type": "application/json" })
-      setSessionCookie(headers, req, sessionCookie.value, sessionCookie.maxAge)
-      return new Response(JSON.stringify({ return_url: DEFAULT_OAUTH_RETURN_URL }), {
-        status: 200,
-        headers,
-      })
-    } catch (e) {
-      return json({ error: e instanceof Error ? e.message : "Invalid request" }, 400)
-    }
+    return json({ error: "OAuth sign-in is not configured for the Cloudflare Worker deployment" }, 410)
   }
 
-  // POST /api/auth/logout -- forward to Nebula to revoke session, then clear Observatory cookie
   if (method === "POST" && pathname === "/api/auth/logout") {
     const sessionId = getSessionIdFromRequest(req)
     if (sessionId) {
-      try {
-        await fetch(`${NEBULA_API}/users/logout`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Cookie: `nebula_session=${encodeURIComponent(sessionId)}`,
-          },
-        })
-      } catch {
-        /* best-effort */
-      }
+      await db.from("auth_sessions").delete().eq("id", sessionId)
     }
     const headers = new Headers({ "Content-Type": "application/json" })
     clearSessionCookie(headers, req)
-    return new Response(JSON.stringify({ message: "Logged out" }), {
-      status: 200,
-      headers,
-    })
+    return new Response(JSON.stringify({ message: "Logged out" }), { status: 200, headers })
   }
 
-  // GET /api/auth/session
   if (method === "GET" && pathname === "/api/auth/session") {
     try {
       const user = await requireAuth(req)
-
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", user.id)
-        .single()
-
+      const { data: profile } = await db.from<any>("profiles").select("*").eq("id", user.id).single()
       return json({
         id: user.id,
         email: user.email,
@@ -210,109 +194,85 @@ export async function handleAuthRoutes(req: Request, url: URL): Promise<Response
         active: true,
       })
     } catch (e) {
-      if (e instanceof AuthError && e.status === 401) {
-        return json({ active: false, user: null })
-      }
-      if (e instanceof AuthError) {
-        return json({ error: e.message }, e.status)
-      }
+      if (e instanceof AuthError && e.status === 401) return json({ active: false, user: null })
+      if (e instanceof AuthError) return json({ error: e.message }, e.status)
       return json({ error: "Authentication service unavailable" }, 503)
     }
   }
 
-  // PUT /api/auth/profile
   if (method === "PUT" && pathname === "/api/auth/profile") {
     try {
       const user = await requireAuth(req)
-      const body = await req.json()
-      const { displayName, avatarUrl } = body
-
-      const updates: Record<string, any> = {
-        updated_at: new Date().toISOString(),
-      }
-      if (displayName !== undefined) updates.display_name = displayName
-      if (avatarUrl !== undefined) updates.avatar_url = avatarUrl
-
-      const { error } = await supabase.from("profiles").update(updates).eq("id", user.id)
-
-      if (error) {
-        return json({ error: error.message }, 500)
-      }
-
+      const body = (await req.json()) as Record<string, any>
+      const updates: Record<string, any> = { updated_at: new Date().toISOString() }
+      if (body.displayName !== undefined) updates.display_name = body.displayName
+      if (body.avatarUrl !== undefined) updates.avatar_url = body.avatarUrl
+      const { error } = await db.from("profiles").update(updates).eq("id", user.id)
+      if (error) return json({ error: error.message }, 500)
       return json({ message: "Profile updated" })
     } catch (e) {
-      if (e instanceof AuthError) {
-        return json({ error: e.message }, e.status)
-      }
+      if (e instanceof AuthError) return json({ error: e.message }, e.status)
       return json({ error: "Unauthorized" }, 401)
     }
   }
 
-  // GET /api/auth/keys - list key names only
   if (method === "GET" && pathname === "/api/auth/keys") {
     try {
       const user = await requireAuth(req)
-      const keyNames = await listUserApiKeyNames(user.id)
-      return json({ keys: keyNames })
+      return json({ keys: await listUserApiKeyNames(user.id) })
     } catch (e) {
-      if (e instanceof AuthError) {
-        return json({ error: e.message }, e.status)
-      }
+      if (e instanceof AuthError) return json({ error: e.message }, e.status)
       return json({ error: "Unauthorized" }, 401)
     }
   }
 
-  // PUT /api/auth/keys/:name - set/update key
   const keySetMatch = pathname.match(/^\/api\/auth\/keys\/([^/]+)$/)
   if (method === "PUT" && keySetMatch) {
     try {
       const user = await requireAuth(req)
       const keyName = decodeURIComponent(keySetMatch[1])
-
       if (!isValidKeyName(keyName)) {
         return json(
-          {
-            error: `Invalid key name: ${keyName}. Valid: supermemory, mem0, zep, nebula, openai, anthropic, google`,
-          },
+          { error: `Invalid key name: ${keyName}. Valid: supermemory, mem0, zep, nebula, openai, anthropic, google` },
           400
         )
       }
-
-      const body = await req.json()
-      const { value } = body
-
-      if (!value || typeof value !== "string") {
+      const body = (await req.json()) as Record<string, any>
+      if (!body.value || typeof body.value !== "string") {
         return json({ error: "Missing or invalid 'value' field" }, 400)
       }
-
-      await setUserApiKey(user.id, keyName, value)
+      await setUserApiKey(user.id, keyName, body.value)
       return json({ message: `Key '${keyName}' saved` })
     } catch (e) {
-      if (e instanceof AuthError) {
-        return json({ error: e.message }, e.status)
-      }
+      if (e instanceof AuthError) return json({ error: e.message }, e.status)
       return json({ error: e instanceof Error ? e.message : "Failed to save key" }, 500)
     }
   }
 
-  // DELETE /api/auth/keys/:name - delete key
   const keyDeleteMatch = pathname.match(/^\/api\/auth\/keys\/([^/]+)$/)
   if (method === "DELETE" && keyDeleteMatch) {
     try {
       const user = await requireAuth(req)
       const keyName = decodeURIComponent(keyDeleteMatch[1])
-
-      if (!isValidKeyName(keyName)) {
-        return json({ error: `Invalid key name: ${keyName}` }, 400)
-      }
-
+      if (!isValidKeyName(keyName)) return json({ error: `Invalid key name: ${keyName}` }, 400)
       await deleteUserApiKey(user.id, keyName)
       return json({ message: `Key '${keyName}' deleted` })
     } catch (e) {
-      if (e instanceof AuthError) {
-        return json({ error: e.message }, e.status)
-      }
+      if (e instanceof AuthError) return json({ error: e.message }, e.status)
       return json({ error: e instanceof Error ? e.message : "Failed to delete key" }, 500)
+    }
+  }
+
+  const keyGetMatch = pathname.match(/^\/api\/auth\/keys\/([^/]+)$/)
+  if (method === "GET" && keyGetMatch) {
+    try {
+      const user = await requireAuth(req)
+      const keyName = decodeURIComponent(keyGetMatch[1])
+      if (!isValidKeyName(keyName)) return json({ error: `Invalid key name: ${keyName}` }, 400)
+      return json({ value: await getUserApiKey(user.id, keyName) })
+    } catch (e) {
+      if (e instanceof AuthError) return json({ error: e.message }, e.status)
+      return json({ error: e instanceof Error ? e.message : "Failed to load key" }, 500)
     }
   }
 

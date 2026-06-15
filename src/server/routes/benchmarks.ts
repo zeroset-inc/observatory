@@ -1,9 +1,6 @@
-import { existsSync } from "fs"
-import { join } from "path"
 import { getAvailableProviders, getProviderInfo } from "../../providers"
 import { getAvailableBenchmarks, createBenchmark } from "../../benchmarks"
 import { MODEL_ALIASES, listModelsByProvider } from "../../utils/models"
-import { getActiveRunsWithBenchmarks } from "../runState"
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -38,50 +35,7 @@ export async function handleBenchmarksRoutes(req: Request, url: URL): Promise<Re
 
   // GET /api/downloads - Check for active downloads by observing filesystem
   if (method === "GET" && pathname === "/api/downloads") {
-    const benchmarkDatasets: Record<string, { path: string; displayName: string }> = {
-      longmemeval: {
-        path: "./data/benchmarks/longmemeval/datasets/longmemeval_s_cleaned.json",
-        displayName: "LongMemEval",
-      },
-      locomo: {
-        path: "./data/benchmarks/locomo/locomo10.json",
-        displayName: "LoCoMo",
-      },
-      atlas: {
-        path: "./data/benchmarks/atlas/simple",
-        displayName: "Atlas",
-      },
-      beam: {
-        path: "./data/benchmarks/beam/beam_100k.json",
-        displayName: "BEAM",
-      },
-    }
-
-    const activeRuns = getActiveRunsWithBenchmarks()
-    const downloads: Array<{ benchmark: string; displayName: string; runId: string }> = []
-    const seenBenchmarks = new Set<string>()
-
-    for (const { runId, benchmark } of activeRuns) {
-      if (seenBenchmarks.has(benchmark)) continue
-
-      const datasetInfo = benchmarkDatasets[benchmark]
-      if (datasetInfo) {
-        const fullPath = join(process.cwd(), datasetInfo.path)
-        if (!existsSync(fullPath)) {
-          downloads.push({
-            benchmark,
-            displayName: datasetInfo.displayName,
-            runId,
-          })
-          seenBenchmarks.add(benchmark)
-        }
-      }
-    }
-
-    return json({
-      hasActive: downloads.length > 0,
-      downloads,
-    })
+    return json({ hasActive: false, downloads: [] })
   }
 
   // GET /api/benchmarks/:name/questions - Preview benchmark questions

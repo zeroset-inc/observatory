@@ -1,8 +1,5 @@
 import type { ICheckpointManager } from "../../orchestrator/checkpoint"
-import { SupabaseCheckpointManager } from "../../orchestrator/supabaseCheckpoint"
-import { orchestrator } from "../../orchestrator"
-import { wsManager } from "../index"
-import { activeRuns, startRun, startRunIfIdle, endRun, requestStop, isRunActive, getRunState, acquireRetrySlot, releaseRetrySlot, setCompletion, waitForCompletionWithTimeout } from "../runState"
+import { D1CheckpointManager } from "../../orchestrator/d1Checkpoint"
 import { createBenchmark } from "../../benchmarks"
 import { createProvider } from "../../providers"
 import { getProviderConfig, getJudgeConfig } from "../../utils/config"
@@ -11,15 +8,21 @@ import { optionalAuth, AuthError } from "../middleware/auth"
 import { fetchAllUserKeys } from "../services/apiKeys"
 import type { ProviderName } from "../../types/provider"
 import type { BenchmarkName } from "../../types/benchmark"
-import type { PhaseId, SamplingConfig } from "../../types/checkpoint"
-import type { ConcurrencyConfig } from "../../types/concurrency"
-import { getPhasesFromPhase, PHASE_ORDER } from "../../types/checkpoint"
-import { autoAddToLeaderboard } from "./leaderboard"
-import { generateReport, saveReport } from "../../orchestrator/phases/report"
+import type { PhaseId } from "../../types/checkpoint"
+import { PHASE_ORDER } from "../../types/checkpoint"
+import { getRunQuestion, listRunQuestions } from "../../repositories/d1/runQuestions"
+import {
+  beginRunDelete,
+  durableRunnerAvailable,
+  enqueueRunStart,
+  releaseRunDelete,
+  retryRunQuestions,
+  requestRunStop as requestDurableRunStop,
+} from "../../runner/client"
 
 function getCheckpointManager(): ICheckpointManager {
-  const { supabase } = require("../db/supabase")
-  return new SupabaseCheckpointManager(supabase)
+  const { db } = require("../db")
+  return new D1CheckpointManager(db)
 }
 
 const checkpointManager = getCheckpointManager()
@@ -46,12 +49,16 @@ function json(data: unknown, status = 200): Response {
   })
 }
 
+function durableRunnerUnavailable(): Response {
+  return json({ error: "Durable runner is not configured" }, 503)
+}
+
 async function verifyRunOwnership(runId: string, user: import("../middleware/auth").AuthUser | null): Promise<Response | null> {
   if (!user) {
     return json({ error: "Authentication required" }, 401)
   }
-  const { supabase } = require("../db/supabase")
-  const { data: run, error } = await supabase
+  const { db } = require("../db")
+  const { data: run, error } = await db
     .from("runs")
     .select("user_id")
     .eq("id", runId)
@@ -73,8 +80,8 @@ async function verifyRunOwnership(runId: string, user: import("../middleware/aut
  * Completed runs are public; non-completed runs require ownership.
  */
 async function verifyRunVisibility(runId: string, user: import("../middleware/auth").AuthUser | null): Promise<Response | null> {
-  const { supabase } = require("../db/supabase")
-  const { data: run, error } = await supabase
+  const { db } = require("../db")
+  const { data: run, error } = await db
     .from("runs")
     .select("status, user_id")
     .eq("id", runId)
@@ -93,7 +100,10 @@ async function verifyRunVisibility(runId: string, user: import("../middleware/au
   return null
 }
 
-export async function handleRunsRoutes(req: Request, url: URL): Promise<Response | null> {
+export async function handleRunsRoutes(
+  req: Request,
+  url: URL
+): Promise<Response | null> {
   const method = req.method
   const pathname = url.pathname
 
@@ -104,8 +114,8 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     const user = await optionalAuth(req)
     const view = url.searchParams.get("view")
 
-    const { supabase } = require("../db/supabase")
-    let query = supabase.from("runs").select("*").order("created_at", { ascending: false })
+    const { db } = require("../db")
+    let query = db.from("runs").select("*").order("created_at", { ascending: false })
 
     if (view === "mine") {
       if (!user) return json({ error: "Authentication required" }, 401)
@@ -148,33 +158,6 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
   if (method === "GET" && runIdMatch) {
     const runId = decodeURIComponent(runIdMatch[1])
 
-    // Handle initializing runs before DB visibility check (row may not exist yet)
-    if (isRunActive(runId)) {
-      const state = getRunState(runId)
-      const user = await optionalAuth(req)
-      // Only the owner can see an initializing run
-      if (state?.userId && (!user || state.userId !== user.id)) {
-        return json({ error: "Run not found" }, 404)
-      }
-
-      const checkpoint = await checkpointManager.load(runId)
-      if (!checkpoint) {
-        return json({
-          runId,
-          status: "initializing",
-          benchmark: state?.benchmark,
-          createdAt: state?.startedAt,
-        })
-      }
-      const summary = checkpointManager.getSummary(checkpoint)
-      const { userId: _uid, ...rest } = checkpoint
-      return json({
-        ...rest,
-        status: getRunStatus(checkpoint, summary),
-        summary,
-      })
-    }
-
     const user = await optionalAuth(req)
     const visError = await verifyRunVisibility(runId, user)
     if (visError) return visError
@@ -200,8 +183,8 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     const visError = await verifyRunVisibility(runId, user)
     if (visError) return visError
 
-    const { supabase } = require("../db/supabase")
-    const { data, error } = await supabase
+    const { db } = require("../db")
+    const { data, error } = await db
       .from("reports")
       .select("report_data")
       .eq("run_id", runId)
@@ -220,44 +203,27 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     const user = await optionalAuth(req)
     const visError = await verifyRunVisibility(runId, user)
     if (visError) return visError
-    const checkpoint = await checkpointManager.load(runId)
-    if (!checkpoint) {
-      return json({ error: "Run not found" }, 404)
-    }
-
-    const page = parseInt(url.searchParams.get("page") || "1")
-    const limit = parseInt(url.searchParams.get("limit") || "50")
+    const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10) || 1)
+    const limit = Math.min(
+      500,
+      Math.max(1, parseInt(url.searchParams.get("limit") || "50", 10) || 50)
+    )
     const status = url.searchParams.get("status")
     const type = url.searchParams.get("type")
 
-    let questions = Object.values(checkpoint.questions)
-
-    if (status) {
-      questions = questions.filter((q) => {
-        const evalStatus = q.phases.evaluate.status
-        if (status === "completed") return evalStatus === "completed"
-        if (status === "failed") return evalStatus === "failed"
-        if (status === "pending") return evalStatus !== "completed" && evalStatus !== "failed"
-        return true
-      })
+    const result = await listRunQuestions({ runId, page, limit, status, type })
+    if (!result) {
+      return json({ error: "Run not found" }, 404)
     }
-
-    if (type) {
-      questions = questions.filter((q) => q.questionType === type)
-    }
-
-    const total = questions.length
-    const start = (page - 1) * limit
-    const paged = questions.slice(start, start + limit)
 
     return json({
-      questions: paged,
-      questionTypeRegistry: getQuestionTypeRegistry(checkpoint.benchmark),
+      questions: result.questions,
+      questionTypeRegistry: getQuestionTypeRegistry(result.benchmark),
       pagination: {
         page,
         limit,
-        total,
-        totalPages: Math.ceil(total / limit),
+        total: result.total,
+        totalPages: Math.ceil(result.total / limit),
       },
     })
   }
@@ -270,17 +236,13 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     const visError = await verifyRunVisibility(runId, user)
     if (visError) return visError
     const questionId = decodeURIComponent(questionDetailMatch[2])
-    const checkpoint = await checkpointManager.load(runId)
-    if (!checkpoint) {
-      return json({ error: "Run not found" }, 404)
-    }
-    const question = checkpoint.questions[questionId]
+    const question = await getRunQuestion(runId, questionId)
     if (!question) {
       return json({ error: "Question not found" }, 404)
     }
 
-    const { supabase } = require("../db/supabase")
-    const { data } = await supabase
+    const { db } = require("../db")
+    const { data } = await db
       .from("search_results")
       .select("*")
       .eq("run_id", runId)
@@ -304,7 +266,7 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
   if (method === "POST" && pathname === "/api/runs/preflight") {
     try {
       const user = await optionalAuth(req)
-      const body = await req.json()
+      const body = (await req.json()) as Record<string, any>
       const { provider, judgeModel } = body
 
       if (!provider || !judgeModel) {
@@ -352,10 +314,10 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
       }
 
       // Rate limit: 10 runs per user per day
-      const { supabase } = require("../db/supabase")
+      const { db } = require("../db")
       const todayStart = new Date()
       todayStart.setUTCHours(0, 0, 0, 0)
-      const { count, error: countError } = await supabase
+      const { count, error: countError } = await db
         .from("runs")
         .select("*", { count: "exact", head: true })
         .eq("user_id", user.id)
@@ -368,7 +330,7 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
       }
 
       const userKeys = await fetchAllUserKeys(user.id)
-      const body = await req.json()
+      const body = (await req.json()) as Record<string, any>
       console.log("[API] Start run request body:", JSON.stringify(body, null, 2))
       const {
         provider,
@@ -430,8 +392,22 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
         )
       }
 
-      if (activeRuns.has(runId)) {
-        return json({ error: "Run is already active" }, 409)
+      if (!durableRunnerAvailable()) {
+        return durableRunnerUnavailable()
+      }
+
+      if (!sourceRunId) {
+        const { data: existingRun, error: existingRunError } = await db
+          .from("runs")
+          .select("user_id")
+          .eq("id", runId)
+          .maybeSingle()
+        if (existingRunError) {
+          return json({ error: "Failed to verify run ownership" }, 500)
+        }
+        if (existingRun?.user_id && existingRun.user_id !== user.id) {
+          return json({ error: "Run already exists" }, 409)
+        }
       }
 
       if (sourceRunId) {
@@ -475,25 +451,24 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
         await checkpointManager.flush(runId)
       }
 
-      startRun(runId, benchmark, user.id)
-
-      const completion = runBenchmark({
+      const result = await enqueueRunStart({
+        kind: "run.start",
         provider: provider as ProviderName,
         benchmark: benchmark as BenchmarkName,
         runId,
         judgeModel,
         userId: user.id,
-        userKeys,
         limit,
         sampling,
         concurrency,
         searchEffort,
         force: sourceRunId ? false : force,
         fromPhase: fromPhase as PhaseId | undefined,
-      }).finally(() => {
-        endRun(runId)
       })
-      setCompletion(runId, completion)
+
+      if (!result.ok) {
+        return json(result.data, result.status)
+      }
 
       return json({ message: "Run started", runId })
     } catch (e) {
@@ -521,265 +496,45 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     } catch {
       return json({ error: "Invalid request body" }, 400)
     }
-    const { questionIds, fromPhase } = body as { questionIds?: string[]; fromPhase?: string }
-    if (!questionIds || questionIds.length === 0) {
+    const { questionIds, fromPhase } = body as { questionIds?: unknown; fromPhase?: string }
+    if (!Array.isArray(questionIds) || questionIds.length === 0) {
       return json({ error: "questionIds is required and must be non-empty" }, 400)
+    }
+    const normalizedQuestionIds = [...new Set(questionIds)].filter(
+      (questionId): questionId is string => typeof questionId === "string" && questionId.length > 0
+    )
+    if (normalizedQuestionIds.length === 0) {
+      return json({ error: "questionIds is required and must contain question ids" }, 400)
     }
 
     const validPhases = ["ingest", "indexing", "search", "evaluate"] as const
     if (fromPhase && !validPhases.includes(fromPhase as any)) {
       return json({ error: `Invalid fromPhase: "${fromPhase}". Must be one of: ${validPhases.join(", ")}` }, 400)
     }
-    const startPhase = (fromPhase as typeof validPhases[number]) || "ingest"
-    const phaseIndex = validPhases.indexOf(startPhase)
-    const phasesToReset = validPhases.slice(phaseIndex)
 
-    const checkpoint = await checkpointManager.load(runId)
-    if (!checkpoint) {
-      return json({ error: "Run not found" }, 404)
-    }
-
-    // Validate all questionIds exist in the checkpoint
-    const missing = questionIds.filter((qId) => !checkpoint.questions[qId])
-    if (missing.length > 0) {
-      return json({ error: `Questions not found: ${missing.join(", ")}` }, 400)
-    }
-
-    // Acquire a retry slot — allows concurrent retries on the same run,
-    // but blocks if a full (non-retry) run is active.
-    // Returns the slot number (1 = first) so we can gate run_started atomically.
-    const retrySlot = acquireRetrySlot(runId, checkpoint.benchmark, user?.id)
-    if (!retrySlot) {
-      return json({ error: "Cannot retry questions while a full run is active" }, 409)
-    }
-
-    // Register a deferred completion promise immediately so that a DELETE
-    // request arriving during the async setup phase (provider init, container
-    // clearing, etc.) will wait for the full retry lifecycle instead of
-    // resolving instantly because no completion was set yet.
-    let resolveSetup!: () => void
-    setCompletion(runId, new Promise<void>((r) => { resolveSetup = r }))
-
-    // Broadcast run_started immediately for the first slot — before any async
-    // work that could fail — so WebSocket clients always get a matching pair.
-    if (retrySlot === 1) {
-      wsManager.broadcast({
-        type: "run_started",
-        runId,
-        provider: checkpoint.provider,
-        benchmark: checkpoint.benchmark,
-      })
-    }
-
-    // Helper: release slot, persist failed status, broadcast, and call endRun if last.
-    // Also resolves the sentinel completion promise so DELETE stops waiting.
-    const releaseSlot = async () => {
-      const isLast = releaseRetrySlot(runId)
-      if (isLast) {
-        try {
-          checkpointManager.updateStatus(checkpoint, "failed")
-          await checkpointManager.flush(runId)
-        } catch (e) {
-          console.error(`[retry] Failed to persist failed status for run ${runId}:`, e)
-        }
-        wsManager.broadcast({
-          type: "run_finished",
-          runId,
-          status: "failed",
-        })
-        endRun(runId)
-      }
-      resolveSetup()
-    }
-
-    try {
-
-      const { supabase } = require("../db/supabase")
-      const userKeys = user ? await fetchAllUserKeys(user.id) : undefined
-
-      // Only clear provider-side data when retrying from ingest (full retry).
-      // Re-ingesting into dirty state produces polluted results.
-      if (startPhase === "ingest") {
-        let provider: ReturnType<typeof createProvider>
-        try {
-          provider = createProvider(checkpoint.provider as ProviderName)
-          await provider.initialize(getProviderConfig(checkpoint.provider, userKeys))
-        } catch (e) {
-          await releaseSlot()
-          return json({ error: `Failed to initialize provider for cleanup: ${e}` }, 500)
-        }
-
-        const clearFailures: string[] = []
-        for (const qId of questionIds) {
-          const containerTag = checkpoint.questions[qId].containerTag
-          try {
-            await provider.clear(containerTag)
-          } catch (e) {
-            clearFailures.push(`${containerTag}: ${e}`)
-          }
-        }
-        if (clearFailures.length > 0) {
-          await releaseSlot()
-          return json({
-            error: `Failed to clear provider data for ${clearFailures.length} question(s). Retry aborted to avoid duplicate data.\n${clearFailures.join("\n")}`,
-          }, 500)
-        }
-      }
-
-      // Reset only the phases from startPhase onward
-      for (const qId of questionIds) {
-        const q = checkpoint.questions[qId]
-        for (const phase of phasesToReset) {
-          if (phase === "ingest") {
-            q.phases.ingest = { status: "pending", completedSessions: [] }
-          } else if (phase === "indexing") {
-            q.phases.indexing = { status: "pending" }
-          } else if (phase === "search") {
-            q.phases.search = { status: "pending" }
-          } else if (phase === "evaluate") {
-            q.phases.evaluate = { status: "pending" }
-          }
-        }
-      }
-
-      // Delete search results if retrying from search or earlier
-      if (phaseIndex <= validPhases.indexOf("search")) {
-        await supabase
-          .from("search_results")
-          .delete()
-          .eq("run_id", runId)
-          .in("question_id", questionIds)
-      }
-
-      await supabase
-        .from("reports")
-        .delete()
-        .eq("run_id", runId)
-
-      // Save only the retried questions — passing questionIds avoids
-      // overwriting other questions with stale data from this snapshot.
-      checkpointManager.save(checkpoint, questionIds)
-      await checkpointManager.flush(runId)
-
-      // Start the run targeting only retried questions (slot already acquired above).
-      // Lifecycle events and report generation are handled in the finalizer below
-      // rather than inside runBenchmark, to avoid premature/stale results from
-      // concurrent retries.
-      const retryCompletion = runBenchmark({
-        provider: checkpoint.provider as ProviderName,
-        benchmark: checkpoint.benchmark as BenchmarkName,
-        runId,
-        judgeModel: checkpoint.judge,
-        userId: user!.id,
-        userKeys,
-        concurrency: checkpoint.concurrency,
-        questionIds,
-        fromPhase: startPhase as PhaseId,
-        skipLifecycleEvents: true,
-        skipReport: true,
-      }).finally(async () => {
-        try {
-          const isLast = releaseRetrySlot(runId)
-          if (isLast) {
-            // Reload checkpoint from DB to get fresh question states from all
-            // concurrent retries, then recompute the run status and report.
-            // The run stays in activeRuns throughout finalization so DELETEs
-            // and new starts are blocked until we're done.
-            try {
-              const finalCheckpoint = await checkpointManager.load(runId)
-              let finalStatus: "completed" | "failed" | "interrupted" = "failed"
-              if (finalCheckpoint) {
-                const questions = Object.values(finalCheckpoint.questions)
-                const allDone = questions.every(
-                  (q) => q.phases.evaluate.status === "completed"
-                )
-                const anyFailed = questions.some(
-                  (q) => Object.values(q.phases).some((p) => p.status === "failed")
-                )
-                const recomputedStatus = allDone ? "completed" : anyFailed ? "failed" : "interrupted"
-                // Preserve "failed" if the error handler already set it (e.g. retry
-                // died during provider/judge init before any phase marked a question
-                // as failed). Don't downgrade to "interrupted".
-                finalStatus = finalCheckpoint.status === "failed" && recomputedStatus === "interrupted"
-                  ? "failed"
-                  : recomputedStatus
-                checkpointManager.updateStatus(finalCheckpoint, finalStatus)
-                await checkpointManager.flush(runId)
-
-                // Regenerate the report from the fresh checkpoint so it reflects
-                // all concurrent retries' results, not just one stale snapshot.
-                try {
-                  const bench = createBenchmark(finalCheckpoint.benchmark as BenchmarkName)
-                  await bench.load()
-                  const report = generateReport(bench, finalCheckpoint)
-                  await saveReport(report)
-                } catch (e) {
-                  console.error(`[retry] Failed to regenerate report:`, e)
-                }
-              }
-
-              if (finalStatus === "completed") {
-                try {
-                  await autoAddToLeaderboard(runId, user!.id)
-                } catch (e) {
-                  console.error(`[retry] Failed to auto-add to leaderboard:`, e)
-                }
-              }
-              wsManager.broadcast({
-                type: "run_finished",
-                runId,
-                status: finalStatus,
-              })
-            } finally {
-              // Only mark the run as idle after all finalization is done
-              endRun(runId)
-            }
-          }
-        } catch (e) {
-          console.error(`[retry] Unexpected error in retry finalizer for run ${runId}:`, e)
-          if (isRunActive(runId)) {
-            endRun(runId)
-          }
-        }
-      })
-      setCompletion(runId, retryCompletion)
-      // The real completion is now tracked — resolve the sentinel so the
-      // combined Promise.all only depends on retryCompletion going forward.
-      resolveSetup()
-
-      return json({ message: "Retry started", runId, questionIds })
-    } catch (e) {
-      await releaseSlot()
-      return json({ error: e instanceof Error ? e.message : "Retry failed" }, 500)
-    }
+    const result = await retryRunQuestions({
+      kind: "run.retry_questions",
+      runId,
+      questionIds: normalizedQuestionIds,
+      fromPhase: (fromPhase as PhaseId | undefined) ?? "ingest",
+    })
+    return json(result.data, result.status)
   }
 
   // POST /api/runs/:runId/stop - Stop running benchmark
   const stopMatch = pathname.match(/^\/api\/runs\/([^/]+)\/stop$/)
   if (method === "POST" && stopMatch) {
     const runId = decodeURIComponent(stopMatch[1])
-    if (!isRunActive(runId)) {
-      return json({ error: "Run is not active" }, 404)
-    }
-
     const user = await optionalAuth(req)
     if (!user) {
       return json({ error: "Authentication required" }, 401)
     }
 
-    // For initializing runs the DB row may not exist yet — check in-memory state
-    const runState = getRunState(runId)
-    if (runState?.userId && runState.userId !== user.id) {
-      return json({ error: "Forbidden" }, 403)
-    }
-    // If DB row exists, verify ownership there too
-    if (!runState?.userId) {
-      const ownerError = await verifyRunOwnership(runId, user)
-      if (ownerError) return ownerError
-    }
+    const ownerError = await verifyRunOwnership(runId, user)
+    if (ownerError) return ownerError
 
-    requestStop(runId)
-    return json({ message: "Stop requested", runId })
+    const result = await requestDurableRunStop(runId)
+    return json(result.data, result.status)
   }
 
   // DELETE /api/runs/:runId - Delete run
@@ -790,36 +545,37 @@ export async function handleRunsRoutes(req: Request, url: URL): Promise<Response
     const ownerError = await verifyRunOwnership(runId, user)
     if (ownerError) return ownerError
 
-    // If run is active, stop it and wait for the background process to
-    // fully wind down before deleting any data.
-    if (isRunActive(runId)) {
-      requestStop(runId)
-      const DELETE_TIMEOUT_MS = 30_000
-      const settled = await waitForCompletionWithTimeout(runId, DELETE_TIMEOUT_MS)
-      if (!settled) {
-        return json({ error: "Run is still shutting down, please retry shortly" }, 503)
-      }
+    const lockResult = await beginRunDelete(runId)
+    if (!lockResult.ok) {
+      return json(lockResult.data, lockResult.status)
     }
+    let deleteLocked = true
 
     const cleanup = url.searchParams.get("cleanup") === "true"
 
-    if (cleanup) {
-      try {
-        const checkpoint = await checkpointManager.load(runId)
-        if (checkpoint) {
-          const ownerId = checkpoint.userId
-          const userKeys = ownerId ? await fetchAllUserKeys(ownerId) : undefined
-          const provider = createProvider(checkpoint.provider as ProviderName)
-          await provider.initialize(getProviderConfig(checkpoint.provider, userKeys))
-          await checkpointManager.deleteWithCleanup(runId, provider)
-        } else {
-          await checkpointManager.delete(runId)
+    try {
+      if (cleanup) {
+        try {
+          const checkpoint = await checkpointManager.load(runId)
+          if (checkpoint) {
+            const ownerId = checkpoint.userId
+            const userKeys = ownerId ? await fetchAllUserKeys(ownerId) : undefined
+            const provider = createProvider(checkpoint.provider as ProviderName)
+            await provider.initialize(getProviderConfig(checkpoint.provider, userKeys))
+            await checkpointManager.deleteWithCleanup(runId, provider)
+          } else {
+            await checkpointManager.delete(runId)
+          }
+        } catch (e) {
+          return json({ error: `Failed to delete with cleanup: ${e}` }, 500)
         }
-      } catch (e) {
-        return json({ error: `Failed to delete with cleanup: ${e}` }, 500)
+      } else {
+        await checkpointManager.delete(runId)
       }
-    } else {
-      await checkpointManager.delete(runId)
+    } finally {
+      if (deleteLocked) {
+        await releaseRunDelete(runId)
+      }
     }
 
     return json({ message: "Run deleted", runId })
@@ -833,9 +589,12 @@ function isPublicRunStatus(status: string): boolean {
 }
 
 function getRunStatusFromDb(run: any, summary: any): string {
-  // Active process takes priority
-  const runState = getRunState(run.id)
-  if (runState) return runState.status
+  if (
+    (run.active_status === "running" || run.active_status === "stopping") &&
+    isActiveLeaseCurrent(run.active_lease_expires_at)
+  ) {
+    return run.active_status
+  }
 
   if (run.status === "completed") return "completed"
   if (run.status === "failed") return "failed"
@@ -853,9 +612,11 @@ function getRunStatusFromDb(run: any, summary: any): string {
 }
 
 function getRunStatus(checkpoint: any, summary: any): string {
-  const runState = getRunState(checkpoint.runId)
-  if (runState) {
-    return runState.status
+  if (
+    (checkpoint.activeStatus === "running" || checkpoint.activeStatus === "stopping") &&
+    isActiveLeaseCurrent(checkpoint.activeLeaseExpiresAt)
+  ) {
+    return checkpoint.activeStatus
   }
 
   if (checkpoint.status === "completed") {
@@ -863,6 +624,9 @@ function getRunStatus(checkpoint: any, summary: any): string {
   }
   if (checkpoint.status === "failed") {
     return "failed"
+  }
+  if (checkpoint.status === "interrupted") {
+    return "partial"
   }
 
   const questions = Object.values(checkpoint.questions || {}) as any[]
@@ -897,91 +661,7 @@ function getRunStatus(checkpoint: any, summary: any): string {
   return "partial"
 }
 
-async function runBenchmark(options: {
-  provider: ProviderName
-  benchmark: BenchmarkName
-  runId: string
-  judgeModel: string
-  userId?: string | null
-  userKeys?: Record<string, string>
-  limit?: number
-  sampling?: SamplingConfig
-  concurrency?: ConcurrencyConfig
-  searchEffort?: "auto" | "low" | "medium" | "high"
-  force?: boolean
-  fromPhase?: PhaseId
-  questionIds?: string[]
-  skipLifecycleEvents?: boolean
-  skipReport?: boolean
-}) {
-  try {
-    if (!options.skipLifecycleEvents) {
-      wsManager.broadcast({
-        type: "run_started",
-        runId: options.runId,
-        provider: options.provider,
-        benchmark: options.benchmark,
-      })
-    }
-
-    let phases = options.fromPhase ? getPhasesFromPhase(options.fromPhase) : undefined
-    if (options.skipReport) {
-      phases = (phases || PHASE_ORDER).filter((p) => p !== "report")
-    }
-
-    await orchestrator.run({
-      provider: options.provider,
-      benchmark: options.benchmark,
-      runId: options.runId,
-      judgeModel: options.judgeModel,
-      userId: options.userId,
-      userKeys: options.userKeys,
-      limit: options.limit,
-      sampling: options.sampling,
-      concurrency: options.concurrency,
-      searchEffort: options.searchEffort,
-      force: options.force,
-      phases,
-      questionIds: options.questionIds,
-    })
-
-    if (!options.skipLifecycleEvents) {
-      // Read the final checkpoint status set by the orchestrator
-      const finalCheckpoint = await checkpointManager.load(options.runId)
-      const finalStatus = finalCheckpoint?.status || "completed"
-
-      // Only add to leaderboard if the run fully completed
-      if (finalStatus === "completed") {
-        try {
-          await autoAddToLeaderboard(options.runId, options.userId)
-        } catch (e) {
-          console.error(`[runBenchmark] Failed to auto-add to leaderboard:`, e)
-        }
-      }
-
-      wsManager.broadcast({
-        type: "run_finished",
-        runId: options.runId,
-        status: finalStatus,
-      })
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error"
-    console.error(`[runBenchmark] Run ${options.runId} failed:`, message)
-
-    // Persist the failure state directly in the DB — avoid updateStatus/save
-    // which would write ALL questions and could overwrite concurrent retries'
-    // progress with stale data from this snapshot.
-    const { supabase: sb } = require("../db/supabase")
-    await sb.from("runs").update({ status: "failed" }).eq("id", options.runId)
-
-    if (!options.skipLifecycleEvents) {
-      const wasStoppedByUser = message.includes("stopped by user")
-      wsManager.broadcast({
-        type: wasStoppedByUser ? "run_stopped" : "error",
-        runId: options.runId,
-        message,
-      })
-    }
-  }
+function isActiveLeaseCurrent(expiresAt?: string | null): boolean {
+  if (!expiresAt) return true
+  return new Date(expiresAt).getTime() > Date.now()
 }

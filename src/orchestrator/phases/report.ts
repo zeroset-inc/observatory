@@ -188,8 +188,8 @@ export function generateReport(benchmark: Benchmark, checkpoint: RunCheckpoint):
 }
 
 export async function saveReport(result: BenchmarkResult): Promise<string> {
-  const { supabase } = require("../../server/db/supabase")
-  const { error } = await supabase.from("reports").upsert(
+  const { db } = require("../../server/db")
+  const { error } = await db.from("reports").upsert(
     {
       run_id: result.runId,
       report_data: result,
@@ -202,7 +202,7 @@ export async function saveReport(result: BenchmarkResult): Promise<string> {
   } else {
     logger.success(`Report saved to database for run ${result.runId}`)
   }
-  return `supabase://reports/${result.runId}`
+  return `db://reports/${result.runId}`
 }
 
 function formatLatencyRow(stats: LatencyStats): string {

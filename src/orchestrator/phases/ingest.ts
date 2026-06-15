@@ -7,6 +7,8 @@ import { logger } from "../../utils/logger"
 import { ConcurrentExecutor } from "../concurrent"
 import { Semaphore } from "../semaphore"
 import { resolveConcurrency } from "../../types/concurrency"
+import type { TaskExecutionGuard } from "../taskGuard"
+import { assertTaskActive, ensureTaskActive, isTaskCancelledError } from "../taskGuard"
 
 const RATE_LIMIT_MS = 0
 const SESSION_CONCURRENCY = 5
@@ -25,7 +27,9 @@ export async function ingestQuestion(
   question: UnifiedQuestion,
   checkpoint: RunCheckpoint,
   checkpointManager: ICheckpointManager,
+  guard?: TaskExecutionGuard,
 ): Promise<{ questionId: string; durationMs: number } | null> {
+  assertTaskActive(guard)
   const { questionId } = question
   const status = checkpointManager.getPhaseStatus(checkpoint, questionId, "ingest")
   if (status === "completed") return null
@@ -41,6 +45,7 @@ export async function ingestQuestion(
   checkpointManager.updateSessions(checkpoint, questionId, sessionsMetadata)
 
   const startTime = Date.now()
+  assertTaskActive(guard)
   checkpointManager.updatePhase(checkpoint, questionId, "ingest", {
     status: "in_progress",
     startedAt: new Date().toISOString(),
@@ -59,11 +64,13 @@ export async function ingestQuestion(
     }
 
     // Process chunks through a global semaphore to cap total outbound Nebula requests
+    await ensureTaskActive(guard)
     const chunkResults = await Promise.all(
       chunks.map((chunk) =>
         ingestSemaphore.run(() => provider.ingest(chunk, { containerTag }))
       )
     )
+    await ensureTaskActive(guard)
 
     // Combine all results
     for (let i = 0; i < chunkResults.length; i++) {
@@ -105,6 +112,7 @@ export async function ingestQuestion(
     }
 
     const durationMs = Date.now() - startTime
+    assertTaskActive(guard)
     checkpointManager.updatePhase(checkpoint, questionId, "ingest", {
       status: "completed",
       ingestResult: combinedResult,
@@ -114,6 +122,7 @@ export async function ingestQuestion(
 
     return { questionId, durationMs }
   } catch (e) {
+    if (isTaskCancelledError(e)) throw e
     const error = e instanceof Error ? e.message : String(e)
     checkpointManager.updatePhase(checkpoint, questionId, "ingest", {
       status: "failed",

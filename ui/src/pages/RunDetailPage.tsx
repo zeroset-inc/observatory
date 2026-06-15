@@ -137,10 +137,9 @@ export default function RunDetailPage() {
     }
   }, [runId])
 
-  // Fire retry requests directly — the backend supports concurrent retries
-  // so there's no need to queue and wait for each one to finish.
+  // The durable runner serializes retry generations per run.
   async function handleRetry(questionIds: string[], fromPhase?: string) {
-    if (!run) return
+    if (!run || isRunning || retryingIdsRef.current.size > 0) return
     // Synchronous dedup against ref to handle rapid clicks safely
     const newIds = questionIds.filter((id) => !retryingIdsRef.current.has(id))
     if (newIds.length === 0) return
@@ -156,6 +155,7 @@ export default function RunDetailPage() {
     try {
       await retryQuestions(runId, newIds, fromPhase)
       if (mountedRef.current) setReport(null)
+      await refreshData()
       // retryingIdsRef stays set — cleared by poll when questions leave "pending" status.
       // This prevents duplicate retries during the window between POST return and
       // backend processing start.
@@ -486,7 +486,7 @@ export default function RunDetailPage() {
             showCopyResults={isSettled && evaluatedQuestions.length > 0}
             onCopyResults={copyResults}
             copied={copied}
-            canRetry={(!isRunning || retryingQuestions.size > 0) && !!user}
+            canRetry={!isRunning && retryingQuestions.size === 0 && !!user}
             onRetry={handleRetry}
             retrying={retryingQuestions}
           />

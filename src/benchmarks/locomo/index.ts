@@ -9,6 +9,7 @@ import type {
 } from "../../types/unified"
 import type { LoCoMoItem, LoCoMoMessage } from "./types"
 import { logger } from "../../utils/logger"
+import { isWorkerRuntime } from "../../server/runtime"
 
 const DEFAULT_DATA_PATH = "./data/benchmarks/locomo/locomo10.json"
 const GITHUB_DATASET_URL =
@@ -81,6 +82,16 @@ export class LoCoMoBenchmark implements Benchmark {
   private sessionsMap: Map<string, UnifiedSession[]> = new Map()
 
   async load(config?: BenchmarkConfig): Promise<void> {
+    if (isWorkerRuntime()) {
+      logger.info("Loading LoCoMo dataset from GitHub...")
+      const response = await fetch(GITHUB_DATASET_URL)
+      if (!response.ok) throw new Error(`Failed to download dataset: ${response.status}`)
+      this.data = (await response.json()) as LoCoMoItem[]
+      logger.info(`Loaded ${this.data.length} conversations from LoCoMo`)
+      this.processData()
+      return
+    }
+
     const dataPath = config?.dataPath || DEFAULT_DATA_PATH
     const fullPath = join(process.cwd(), dataPath)
 

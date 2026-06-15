@@ -1,15 +1,13 @@
-import { existsSync, readFileSync } from "fs"
-import { join } from "path"
 import type { ICheckpointManager } from "../../orchestrator/checkpoint"
-import { SupabaseCheckpointManager } from "../../orchestrator/supabaseCheckpoint"
+import { D1CheckpointManager } from "../../orchestrator/d1Checkpoint"
 import { createBenchmark } from "../../benchmarks"
 import { optionalAuth } from "../middleware/auth"
 import type { BenchmarkName } from "../../types/benchmark"
 import { logger } from "../../utils/logger"
 
 function getCheckpointManager(): ICheckpointManager {
-  const { supabase } = require("../db/supabase")
-  return new SupabaseCheckpointManager(supabase)
+  const { db } = require("../db")
+  return new D1CheckpointManager(db)
 }
 
 const checkpointManager = getCheckpointManager()
@@ -31,9 +29,9 @@ function getQuestionTypeRegistry(benchmarkName: string) {
   return benchmarkRegistryCache[benchmarkName]
 }
 
-function getSupabase() {
-  const { supabase } = require("../db/supabase")
-  return supabase
+function getDb() {
+  const { db } = require("../db")
+  return db
 }
 
 function mapEntryToCamelCase(entry: any) {
@@ -70,7 +68,7 @@ function json(data: unknown, status = 200): Response {
  * Skips sampled/limited runs (test/debug runs).
  */
 export async function autoAddToLeaderboard(runId: string, userId?: string | null): Promise<void> {
-  const supabase = getSupabase()
+  const db = getDb()
   const checkpoint = await checkpointManager.load(runId)
   if (!checkpoint) {
     logger.warn(`[autoAddToLeaderboard] Checkpoint not found for ${runId}, skipping`)
@@ -89,7 +87,7 @@ export async function autoAddToLeaderboard(runId: string, userId?: string | null
 
   // Load report for accuracy stats
   let report: any = null
-  const { data: reportData } = await supabase
+  const { data: reportData } = await db
     .from("reports")
     .select("report_data")
     .eq("run_id", runId)
@@ -167,7 +165,7 @@ export async function autoAddToLeaderboard(runId: string, userId?: string | null
   }
 
   // Idempotent: UNIQUE(run_id) index means re-runs via --force are silently skipped
-  const { error } = await supabase
+  const { error } = await db
     .from("leaderboard_entries")
     .upsert(entryData, { onConflict: "run_id", ignoreDuplicates: true })
 
@@ -185,8 +183,8 @@ export async function handleLeaderboardRoutes(req: Request, url: URL): Promise<R
   // GET /api/leaderboard - List all leaderboard entries
   if (method === "GET" && pathname === "/api/leaderboard") {
     try {
-      const supabase = getSupabase()
-      const { data: entries, error } = await supabase
+      const db = getDb()
+      const { data: entries, error } = await db
         .from("leaderboard_entries")
         .select("*, profiles:user_id(display_name, avatar_url)")
         .order("added_at", { ascending: false })
@@ -218,10 +216,10 @@ export async function handleLeaderboardRoutes(req: Request, url: URL): Promise<R
   const deleteMatch = pathname.match(LEADERBOARD_ENTRY_ROUTE)
   if (method === "DELETE" && deleteMatch) {
     try {
-      const supabase = getSupabase()
+      const db = getDb()
       const id = parseInt(deleteMatch[1])
 
-      const { data: entry, error: fetchError } = await supabase
+      const { data: entry, error: fetchError } = await db
         .from("leaderboard_entries")
         .select("id")
         .eq("id", id)
@@ -231,7 +229,7 @@ export async function handleLeaderboardRoutes(req: Request, url: URL): Promise<R
         return json({ error: "Entry not found" }, 404)
       }
 
-      const { error: deleteError } = await supabase
+      const { error: deleteError } = await db
         .from("leaderboard_entries")
         .delete()
         .eq("id", id)
@@ -251,10 +249,10 @@ export async function handleLeaderboardRoutes(req: Request, url: URL): Promise<R
   const getMatch = pathname.match(LEADERBOARD_ENTRY_ROUTE)
   if (method === "GET" && getMatch) {
     try {
-      const supabase = getSupabase()
+      const db = getDb()
       const id = parseInt(getMatch[1])
 
-      const { data: entry, error } = await supabase
+      const { data: entry, error } = await db
         .from("leaderboard_entries")
         .select("*, profiles:user_id(display_name, avatar_url)")
         .eq("id", id)
@@ -274,53 +272,12 @@ export async function handleLeaderboardRoutes(req: Request, url: URL): Promise<R
 }
 
 function getProviderCode(provider: string): string {
-  const providerDir = join(process.cwd(), "src", "providers", provider)
-  const indexPath = join(providerDir, "index.ts")
-  const promptPath = join(providerDir, "prompt.ts")
-  const promptsPath = join(providerDir, "prompts.ts")
-
-  const files: Record<string, string> = {}
-
-  if (existsSync(indexPath)) {
-    files["index.ts"] = readFileSync(indexPath, "utf8")
-  }
-  if (existsSync(promptPath)) {
-    files["prompt.ts"] = readFileSync(promptPath, "utf8")
-  }
-  if (existsSync(promptsPath)) {
-    files["prompts.ts"] = readFileSync(promptsPath, "utf8")
-  }
-
-  if (Object.keys(files).length === 0) {
-    return `// Provider code not found at ${providerDir}`
-  }
-
-  return JSON.stringify(files)
+  return JSON.stringify({
+    provider,
+    source: "Bundled in the Observatory Worker deployment.",
+  })
 }
 
 function getProviderPrompts(provider: string): Record<string, string> | null {
-  const providerDir = join(process.cwd(), "src", "providers", provider)
-  const prompts: Record<string, string> = {}
-
-  const promptFiles = ["prompt.ts", "prompts.ts"]
-  for (const file of promptFiles) {
-    const filePath = join(providerDir, file)
-    if (existsSync(filePath)) {
-      prompts[file] = readFileSync(filePath, "utf8")
-    }
-  }
-
-  const indexPath = join(providerDir, "index.ts")
-  if (existsSync(indexPath)) {
-    const code = readFileSync(indexPath, "utf8")
-    const promptMatches = code.matchAll(
-      /(?:prompt|PROMPT|systemPrompt|userPrompt)\s*[=:]\s*[`"']([^`"']+)[`"']/g
-    )
-    for (const match of promptMatches) {
-      const key = match[0].split(/[=:]/)[0].trim()
-      prompts[`inline:${key}`] = match[1]
-    }
-  }
-
-  return Object.keys(prompts).length > 0 ? prompts : null
+  return { provider }
 }

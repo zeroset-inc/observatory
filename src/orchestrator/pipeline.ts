@@ -22,7 +22,7 @@ import type { ICheckpointManager } from "./checkpoint"
 import { Semaphore } from "./semaphore"
 import { IndexingCoordinator } from "./indexingCoordinator"
 import { resolveConcurrency, type PhaseId } from "../types/concurrency"
-import { shouldStop } from "../server/runState"
+import { isRunStopRequested } from "../server/runControl"
 import { logger } from "../utils/logger"
 import { ingestQuestion } from "./phases/ingest"
 import { indexQuestion } from "./phases/indexing"
@@ -103,7 +103,7 @@ export async function runPipeline(options: PipelineOptions): Promise<void> {
       // Fail-fast: stop if another question errored
       if (firstError) return
       // Check for stop signal
-      if (shouldStop(checkpoint.runId)) {
+      if (await isRunStopRequested(checkpoint.runId)) {
         if (!firstError) {
           firstError = new Error("Run stopped by user.")
         }
@@ -116,7 +116,7 @@ export async function runPipeline(options: PipelineOptions): Promise<void> {
         // Indexing with coordinator bypasses the semaphore — the coordinator
         // batches all questions into a single shared polling loop.
         if (phase === "indexing" && coordinator) {
-          if (firstError || shouldStop(checkpoint.runId)) return
+          if (firstError || (await isRunStopRequested(checkpoint.runId))) return
           const result = await coordinator.awaitQuestion(question.questionId)
           if (result) {
             progress.increment("indexing", `${question.questionId} (${result.durationMs}ms)`)
@@ -126,7 +126,7 @@ export async function runPipeline(options: PipelineOptions): Promise<void> {
         } else {
         await semaphores[phase]!.run(async () => {
           // Re-check after acquiring semaphore
-          if (firstError || shouldStop(checkpoint.runId)) return
+          if (firstError || (await isRunStopRequested(checkpoint.runId))) return
 
           switch (phase) {
             case "ingest": {

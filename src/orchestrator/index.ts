@@ -7,7 +7,7 @@ import { createProvider } from "../providers"
 import { createBenchmark } from "../benchmarks"
 import { createJudge } from "../judges"
 import type { ICheckpointManager } from "./checkpoint"
-import { SupabaseCheckpointManager } from "./supabaseCheckpoint"
+import { D1CheckpointManager } from "./d1Checkpoint"
 import { getProviderConfig, getJudgeConfig } from "../utils/config"
 import { resolveModel } from "../utils/models"
 import { logger } from "../utils/logger"
@@ -65,8 +65,8 @@ function selectQuestionsBySampling(
 }
 
 function createCheckpointManager(): ICheckpointManager {
-  const { supabase } = require("../server/db/supabase")
-  return new SupabaseCheckpointManager(supabase)
+  const { db } = require("../server/db")
+  return new D1CheckpointManager(db)
 }
 
 export class Orchestrator {
@@ -150,6 +150,17 @@ export class Orchestrator {
     if ((await this.checkpointManager.exists(runId)) && !isNewRun) {
       checkpoint = (await this.checkpointManager.load(runId))!
 
+      if (
+        checkpoint.status === "initializing" &&
+        Object.keys(checkpoint.questions).length === 0
+      ) {
+        isNewRun = true
+        logger.info("Initializing pre-created checkpoint")
+      }
+    }
+
+    if ((await this.checkpointManager.exists(runId)) && !isNewRun) {
+      if (!checkpoint) checkpoint = (await this.checkpointManager.load(runId))!
       effectiveLimit = checkpoint.limit
       targetQuestionIds = checkpoint.targetQuestionIds
 

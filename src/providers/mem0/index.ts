@@ -115,7 +115,7 @@ export class Mem0Provider implements Provider {
       headers: { Authorization: `Token ${this.apiKey}` },
     })
     if (!response.ok) return "UNKNOWN"
-    const data = await response.json()
+    const data = (await response.json()) as { status?: string }
     return data.status || "UNKNOWN"
   }
 

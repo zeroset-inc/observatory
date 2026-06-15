@@ -4,8 +4,12 @@
   "type": "module",
   "scripts": {
     "preinstall": "bunx only-allow bun",
-    "start": "bun run src/index.ts",
-    "dev": "bun run src/index.ts",
+    "start": "wrangler dev --local",
+    "dev": "wrangler dev --local",
+    "build": "cd ui && bun run build",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply observatory --local",
+    "db:migrate:remote": "wrangler d1 migrations apply observatory --remote",
     "test": "bun test",
     "format": "prettier --write \"src/**/*.ts\" \"ui/**/*.tsx\" \"ui/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"ui/**/*.tsx\" \"ui/**/*.ts\""
@@ -16,16 +20,16 @@
     "@ai-sdk/openai": "^2.0.88",
     "@getzep/zep-cloud": "^3.13.0",
     "@nebula-ai/sdk": "^1.2.2",
-    "@supabase/supabase-js": "^2.95.3",
     "ai": "^5.0.115",
-    "jose": "^6.2.2",
     "mem0ai": "^2.1.38",
     "supermemory": "^4.0.0",
     "zod": "^3.24.4"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260609.1",
     "@types/bun": "^1.2.14",
     "prettier": "^3.7.4",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "wrangler": "^4.0.0"
   }
 }

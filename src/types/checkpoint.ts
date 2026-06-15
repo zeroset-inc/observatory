@@ -101,6 +101,8 @@ export interface RunCheckpoint {
   dataSourceRunId: string
   userId?: string | null
   status: RunStatus
+  activeStatus?: "running" | "stopping" | null
+  activeLeaseExpiresAt?: string | null
   provider: string
   benchmark: string
   judge: string

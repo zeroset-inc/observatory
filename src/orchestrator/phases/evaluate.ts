@@ -9,6 +9,8 @@ import { ConcurrentExecutor } from "../concurrent"
 import { resolveConcurrency } from "../../types/concurrency"
 import { calculateRetrievalMetrics } from "./retrieval-eval"
 import { buildContextString } from "../../types/prompts"
+import type { TaskExecutionGuard } from "../taskGuard"
+import { assertTaskActive, ensureTaskActive, isTaskCancelledError } from "../taskGuard"
 
 /**
  * Evaluate a single question using the judge.
@@ -20,13 +22,16 @@ export async function evaluateQuestion(
   checkpoint: RunCheckpoint,
   checkpointManager: ICheckpointManager,
   provider?: Provider,
+  guard?: TaskExecutionGuard,
 ): Promise<{ questionId: string; durationMs: number; label: string } | null> {
+  assertTaskActive(guard)
   const { questionId } = question
   const evalStatus = checkpointManager.getPhaseStatus(checkpoint, questionId, "evaluate")
   const searchStatus = checkpointManager.getPhaseStatus(checkpoint, questionId, "search")
   if (evalStatus === "completed" || searchStatus !== "completed") return null
 
   const startTime = Date.now()
+  assertTaskActive(guard)
   checkpointManager.updatePhase(checkpoint, questionId, "evaluate", {
     status: "in_progress",
     startedAt: new Date().toISOString(),
@@ -40,8 +45,8 @@ export async function evaluateQuestion(
     if (searchPhase?.results && searchPhase.results.length > 0) {
       searchResults = searchPhase.results
     } else {
-      const { supabase } = require("../../server/db/supabase")
-      const { data } = await supabase
+      const { db } = require("../../server/db")
+      const { data } = await db
         .from("search_results")
         .select("results")
         .eq("run_id", checkpoint.runId)
@@ -64,6 +69,7 @@ export async function evaluateQuestion(
       }
     }
 
+    await ensureTaskActive(guard)
     const [result, retrievalMetrics] = await Promise.all([
       judge.evaluate({
         question: question.question,
@@ -80,6 +86,7 @@ export async function evaluateQuestion(
         searchResults
       ),
     ])
+    await ensureTaskActive(guard)
 
     const durationMs = Date.now() - startTime
     checkpointManager.updatePhase(checkpoint, questionId, "evaluate", {
@@ -94,6 +101,7 @@ export async function evaluateQuestion(
 
     return { questionId, durationMs, label: result.label }
   } catch (e) {
+    if (isTaskCancelledError(e)) throw e
     const error = e instanceof Error ? e.message : String(e)
     checkpointManager.updatePhase(checkpoint, questionId, "evaluate", {
       status: "failed",

@@ -1,15 +1,15 @@
 import { applyQueuedSessionCookie } from "./sessionCookie"
 import { applyResponseCorsHeaders, buildPreflightResponse } from "./cors"
 
-export interface UpgradeCapableServer {
-  upgrade(req: Request): boolean
-}
-
 export interface ServerFetchDependencies {
   checkReadiness: () => Promise<void>
   getErrorStatus?: (error: unknown) => number
   handleApiRequest: (req: Request, url: URL) => Promise<Response | null>
   serveStaticUi?: (url: URL) => Promise<Response | null>
+}
+
+export interface BackgroundExecutionContext {
+  waitUntil(promise: Promise<unknown>): void
 }
 
 function jsonResponse(data: unknown, init: ResponseInit = {}): Response {
@@ -36,10 +36,7 @@ export function finalizeResponse(req: Request, response: Response): Response {
 export function createServerFetchHandler(dependencies: ServerFetchDependencies) {
   const getErrorStatus = dependencies.getErrorStatus ?? (() => 500)
 
-  return async function handleServerFetch(
-    req: Request,
-    server: UpgradeCapableServer
-  ): Promise<Response | undefined> {
+  return async function handleServerFetch(req: Request): Promise<Response> {
     const url = new URL(req.url)
 
     if (req.method === "OPTIONS") {
@@ -61,12 +58,6 @@ export function createServerFetchHandler(dependencies: ServerFetchDependencies) 
           jsonResponse({ status: "not_ready", error: message }, { status: 503 })
         )
       }
-    }
-
-    if (url.pathname === "/ws") {
-      const upgraded = server.upgrade(req)
-      if (upgraded) return undefined
-      return new Response("WebSocket upgrade failed", { status: 400 })
     }
 
     try {

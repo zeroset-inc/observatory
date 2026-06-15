@@ -4,7 +4,7 @@
 
 Memory is becoming core infrastructure for AI agents, yet there is no standard way to measure it. Observatory provides reproducible, multi-dimensional benchmarks for memory providers — and publishes all results to a public leaderboard.
 
-**Leaderboard:** [observatory.trynebula.ai](https://observatory.trynebula.ai)
+**Leaderboard:** [observatory.zeroset.com](https://observatory.zeroset.com)
 
 ---
 
@@ -66,7 +66,7 @@ Any memory system with a retrieval API can be evaluated. Built-in integrations:
 | Provider | Architecture |
 |----------|-------------|
 | [Mem0](https://mem0.ai) | Memory graph |
-| [Nebula](https://trynebula.ai) | Hybrid retrieval |
+| [Nebula](https://zeroset.com) | Hybrid retrieval |
 | [Supermemory](https://supermemory.ai) | Vector retrieval |
 | [Zep](https://getzep.com) | Graph-based memory |
 
@@ -94,21 +94,25 @@ INGEST  →  INDEX  →  SEARCH  →  EVALUATE  →  REPORT
 
 ```bash
 bun install
-bun dev          # start Observatory on localhost:3003
+cd ui && bun install
+cd ..
+bun run build
+bun run db:migrate:local
+bun dev
 ```
 
 Add your API keys — at least one memory provider key and one LLM judge key.
 
-- **Hosted** ([observatory.trynebula.ai](https://observatory.trynebula.ai)): Open **Settings** in the sidebar. Keys are encrypted per-user and persist across runs.
-- **Self-hosted**: Copy `.env.example` to `.env.local` and fill in your keys:
+- **Hosted** ([observatory.zeroset.com](https://observatory.zeroset.com)): Open **Settings** in the sidebar. Keys are encrypted per-user in Cloudflare D1 and persist across runs.
+- **Self-hosted Worker**: copy `.env.example` to `.dev.vars` for local Wrangler development, or set production secrets with `wrangler secret put`:
 
 ```bash
-cp .env.example .env.local
+cp .env.example .dev.vars
+wrangler secret put OBSERVATORY_SECRET
 
 # Memory providers (at least one)
 MEM0_API_KEY=
 NEBULA_API_KEY=
-NEBULA_SECRET_KEY=
 SUPERMEMORY_API_KEY=
 ZEP_API_KEY=
 
@@ -121,9 +125,34 @@ GOOGLE_API_KEY=
 OBSERVATORY_ALLOWED_ORIGINS=http://localhost:3003
 ```
 
-Current server builds require `NEBULA_SECRET_KEY` on self-hosted instances. Set it to the same JWT signing key used by Nebula so the server can verify bearer tokens locally; the Settings UI then becomes available and user-provided keys take priority over environment variables.
+Deployments are owned by Cloudflare Workers now. The Worker is bound to custom domains:
 
-If you are upgrading an existing deployment across the Nebula profile migrations, backfill `profiles.nebula_user_id` and normalized `profiles.email` before `014_finalize_nebula_profiles.sql` runs. That migration intentionally aborts until the profile cutover is complete.
+- Production: `observatory.zeroset.com`
+- Staging: `observatory-staging.zeroset.com`
+
+Cloudflare setup and deployment are automated through GitHub Actions:
+
+- `Bootstrap Cloudflare Observatory` is a manual setup/repair workflow. It resolves or creates the target D1 database by name, injects the database ID into `wrangler.toml`, creates the target Queue if missing, applies D1 migrations, syncs Worker secrets, optionally removes conflicting DNS records, and deploys the selected Worker environment.
+- `Deploy Observatory Worker` is the routine deploy workflow. It runs automatically for production on pushes to `main`, and can be manually dispatched for staging. It resolves existing resources, applies migrations, syncs Worker secrets, and deploys the Worker without mutating DNS or creating infrastructure.
+
+One-time GitHub Actions configuration in `zeroset-inc/observatory`:
+
+```bash
+gh variable set CLOUDFLARE_ACCOUNT_ID --repo zeroset-inc/observatory --body <account-id>
+gh secret set CLOUDFLARE_BOOTSTRAP_API_TOKEN --repo zeroset-inc/observatory
+gh secret set CLOUDFLARE_API_TOKEN --repo zeroset-inc/observatory
+gh secret set OBSERVATORY_SECRET --repo zeroset-inc/observatory
+```
+
+`CLOUDFLARE_BOOTSTRAP_API_TOKEN` should be Observatory-specific and scoped to the target account/zones with Workers, D1, Queues, Worker custom-domain/route permissions, and `zeroset.com` Zone DNS Read/Edit. DNS access is required only for bootstrap-time cutover so the workflow can replace old ingress records before assigning the Worker custom domain.
+
+`CLOUDFLARE_API_TOKEN` is the narrower routine deploy token. It needs enough account permissions to list the existing D1 database and Queue, apply D1 migrations, sync Worker secrets, and deploy the Worker, but it does not need zone DNS edit.
+
+Run `Bootstrap Cloudflare Observatory` once per environment, or when repairing Cloudflare resources. Pushes to `main` deploy production. Use the `Deploy Observatory Worker` workflow dispatch target `staging` for staging deploys.
+
+Custom-domain cutover is handled by the bootstrap workflow for exact `observatory*.zeroset.com` DNS records when `cutover_dns` is enabled.
+
+Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles.
 
 If your UI runs on a different origin than the API, add that origin to `OBSERVATORY_ALLOWED_ORIGINS`. The server only sends `Access-Control-Allow-Origin` for allowlisted origins.
 
@@ -160,7 +189,7 @@ Contributions welcome — new benchmarks, provider integrations, scoring improve
 
 ## Maintainers
 
-Built by the team at [Nebula](https://trynebula.ai).
+Built by the team at [Nebula](https://zeroset.com).
 
 ## License
 

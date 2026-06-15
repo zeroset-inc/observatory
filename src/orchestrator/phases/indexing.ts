@@ -4,6 +4,8 @@ import type { ICheckpointManager } from "../checkpoint"
 import { logger } from "../../utils/logger"
 import { ConcurrentExecutor } from "../concurrent"
 import { resolveConcurrency } from "../../types/concurrency"
+import type { TaskExecutionGuard } from "../taskGuard"
+import { assertTaskActive, ensureTaskActive, isTaskCancelledError } from "../taskGuard"
 
 function getEpisodeCount(question: QuestionCheckpoint): number {
   const ingestResult = question.phases.ingest.ingestResult
@@ -66,18 +68,26 @@ class IndexingProgressTracker {
       const percent = agg.total > 0 ? Math.round((agg.completed / agg.total) * 100) : 0
       const bar = "█".repeat(Math.floor(percent / 5)) + "░".repeat(20 - Math.floor(percent / 5))
       const failedStr = agg.failed > 0 ? ` (${agg.failed} failed)` : ""
-      process.stdout.write(
-        `\r\x1b[36m[${bar}]\x1b[0m ${percent}% Indexing: ${agg.completed}/${agg.total} episodes${failedStr}`
-      )
+      const stdout = (globalThis as any).process?.stdout
+      const message = `${percent}% Indexing: ${agg.completed}/${agg.total} episodes${failedStr}`
+      if (typeof stdout?.write === "function") {
+        stdout.write(`\r\x1b[36m[${bar}]\x1b[0m ${message}`)
+      } else {
+        logger.info(message)
+      }
     }
   }
 
   finish(): void {
     const agg = this.getAggregated()
     const failedStr = agg.failed > 0 ? ` (${agg.failed} failed)` : ""
-    process.stdout.write(
-      `\r\x1b[36m[${"█".repeat(20)}]\x1b[0m 100% Indexing: ${agg.completed}/${agg.total} episodes${failedStr}\n`
-    )
+    const stdout = (globalThis as any).process?.stdout
+    const message = `100% Indexing: ${agg.completed}/${agg.total} episodes${failedStr}`
+    if (typeof stdout?.write === "function") {
+      stdout.write(`\r\x1b[36m[${"█".repeat(20)}]\x1b[0m ${message}\n`)
+    } else {
+      logger.info(message)
+    }
   }
 
   getTotalEpisodes(): number {
@@ -97,7 +107,9 @@ export async function indexQuestion(
   checkpointManager: ICheckpointManager,
   questionId: string,
   onProgress?: (questionId: string, progress: IndexingProgress) => void,
+  guard?: TaskExecutionGuard,
 ): Promise<{ questionId: string; durationMs: number } | null> {
+  assertTaskActive(guard)
   const question = checkpoint.questions[questionId]
   if (!question) return null
   if (question.phases.ingest.status !== "completed") return null
@@ -118,6 +130,7 @@ export async function indexQuestion(
   }
 
   const startTime = Date.now()
+  assertTaskActive(guard)
   checkpointManager.updatePhase(checkpoint, questionId, "indexing", {
     status: "in_progress",
     completedIds: [],
@@ -133,6 +146,7 @@ export async function indexQuestion(
     }
 
     await provider.awaitIndexing(ingestResult, question.containerTag, (progress) => {
+      assertTaskActive(guard)
       lastProgress = progress
       onProgress?.(questionId, progress)
       checkpointManager.updatePhase(checkpoint, questionId, "indexing", {
@@ -143,6 +157,7 @@ export async function indexQuestion(
     })
 
     const durationMs = Date.now() - startTime
+    await ensureTaskActive(guard)
     checkpointManager.updatePhase(checkpoint, questionId, "indexing", {
       status: "completed",
       completedIds: lastProgress.completedIds,
@@ -153,6 +168,7 @@ export async function indexQuestion(
 
     return { questionId, durationMs }
   } catch (e) {
+    if (isTaskCancelledError(e)) throw e
     const error = e instanceof Error ? e.message : String(e)
     checkpointManager.updatePhase(checkpoint, questionId, "indexing", {
       status: "failed",

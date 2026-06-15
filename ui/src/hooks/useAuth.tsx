@@ -1,9 +1,7 @@
 import { useState, useCallback, useContext, createContext, type ReactNode } from "react"
 import { useMountEffect } from "./useMountEffect"
-import { rememberOAuthReturnPath } from "../lib/authRedirect"
 
 const API_BASE = import.meta.env.VITE_API_URL || ""
-const NEBULA_API = import.meta.env.VITE_NEBULA_API_URL || "https://api.trynebula.ai"
 
 export interface AuthUser {
   id: string
@@ -17,7 +15,6 @@ export interface AuthContextType {
   loading: boolean
   signIn: (email: string, password: string) => Promise<unknown>
   signUp: (email: string, password: string, displayName?: string) => Promise<unknown>
-  signInWithOAuth: (provider: "github" | "google") => Promise<void>
   signOut: () => Promise<void>
 }
 
@@ -95,18 +92,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return data
   }, [])
 
-  const signInWithOAuth = useCallback(async (provider: "github" | "google") => {
-    rememberOAuthReturnPath(
-      `${window.location.pathname}${window.location.search}${window.location.hash}`
-    )
-
-    const params = new URLSearchParams({
-      returnUrl: window.location.pathname + window.location.search,
-      frontendOrigin: window.location.origin,
-    })
-    window.location.href = `${NEBULA_API}/v1/users/oauth/${provider}/authorize?${params.toString()}`
-  }, [])
-
   const signOut = useCallback(async () => {
     try {
       await fetch(`${API_BASE}/api/auth/logout`, {
@@ -124,7 +109,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     loading,
     signIn,
     signUp,
-    signInWithOAuth,
     signOut,
   }
 

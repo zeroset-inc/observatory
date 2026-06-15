@@ -6,7 +6,7 @@ import { useAuth } from "../../hooks/useAuth"
 
 export function RootLayout() {
   const [showAuthModal, setShowAuthModal] = useState(false)
-  const { user, signIn, signUp, signInWithOAuth, signOut } = useAuth()
+  const { user, signIn, signUp, signOut } = useAuth()
 
   const userForNav = user
     ? {
@@ -28,7 +28,7 @@ export function RootLayout() {
       <footer className="border-t border-border py-6 text-center text-xs text-text-muted">
         Built by{" "}
         <a
-          href="https://trynebula.ai"
+          href="https://zeroset.com"
           target="_blank"
           rel="noopener noreferrer"
           className="text-text-secondary hover:text-text-primary transition-colors"
@@ -43,7 +43,6 @@ export function RootLayout() {
         onClose={() => setShowAuthModal(false)}
         onSignIn={signIn}
         onSignUp={signUp}
-        onOAuthSignIn={signInWithOAuth}
       />
     </div>
   )

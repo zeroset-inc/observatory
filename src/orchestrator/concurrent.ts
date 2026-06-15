@@ -1,5 +1,5 @@
 import { logger } from "../utils/logger"
-import { shouldStop } from "../server/runState"
+import { isRunStopRequested } from "../server/runControl"
 
 export interface ConcurrentTaskContext<T> {
   item: T
@@ -51,7 +51,7 @@ export class ConcurrentExecutor {
       const runNext = async () => {
         if (hasError) return
 
-        if (shouldStop(runId)) {
+        if (await isRunStopRequested(runId)) {
           if (activeTasks === 0 && !hasError) {
             reject(new Error(`Run stopped by user.`))
           }

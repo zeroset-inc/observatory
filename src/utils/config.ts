@@ -1,3 +1,5 @@
+import { getEnvValue } from "../server/runtime"
+
 export interface Config {
   supermemoryApiKey: string
   supermemoryBaseUrl: string
@@ -8,32 +10,20 @@ export interface Config {
   googleApiKey: string
   nebulaApiKey: string
   nebulaBaseUrl: string
-  nebulaJwksUrl: string
-  supabaseUrl: string
-  supabaseServiceRoleKey: string
-  supabaseAnonKey: string
-  databaseUrl: string
 }
 
-const nebulaBaseUrl = process.env.NEBULA_BASE_URL || "https://api.trynebula.ai"
+const nebulaBaseUrl = getEnvValue("NEBULA_BASE_URL") || "https://api.zeroset.com"
 
 export const config: Config = {
-  supermemoryApiKey: process.env.SUPERMEMORY_API_KEY || "",
-  supermemoryBaseUrl: process.env.SUPERMEMORY_BASE_URL || "https://api.supermemory.ai",
-  mem0ApiKey: process.env.MEM0_API_KEY || "",
-  zepApiKey: process.env.ZEP_API_KEY || "",
-  openaiApiKey: process.env.OPENAI_API_KEY || "",
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
-  googleApiKey: process.env.GOOGLE_API_KEY || "",
-  nebulaApiKey: process.env.NEBULA_API_KEY || "",
+  supermemoryApiKey: getEnvValue("SUPERMEMORY_API_KEY") || "",
+  supermemoryBaseUrl: getEnvValue("SUPERMEMORY_BASE_URL") || "https://api.supermemory.ai",
+  mem0ApiKey: getEnvValue("MEM0_API_KEY") || "",
+  zepApiKey: getEnvValue("ZEP_API_KEY") || "",
+  openaiApiKey: getEnvValue("OPENAI_API_KEY") || "",
+  anthropicApiKey: getEnvValue("ANTHROPIC_API_KEY") || "",
+  googleApiKey: getEnvValue("GOOGLE_API_KEY") || "",
+  nebulaApiKey: getEnvValue("NEBULA_API_KEY") || "",
   nebulaBaseUrl,
-  nebulaJwksUrl:
-    process.env.NEBULA_JWKS_URL ||
-    new URL("/.well-known/jwks.json", nebulaBaseUrl).toString(),
-  supabaseUrl: process.env.SUPABASE_URL || "",
-  supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
-  supabaseAnonKey: process.env.SUPABASE_ANON_KEY || "",
-  databaseUrl: process.env.DATABASE_URL || "",
 }
 
 /**
