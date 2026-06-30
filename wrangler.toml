@@ -2,7 +2,8 @@
 
 name = "observatory"
 main = "src/worker.ts"
-compatibility_date = "2026-06-09"
+
+compatibility_date = "2026-06-30"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = false
 
@@ -21,7 +22,7 @@ crons = ["*/5 * * * *"]
 [[d1_databases]]
 binding = "OBSERVATORY_DB"
 database_name = "observatory"
-database_id = "REPLACE_WITH_OBSERVATORY_D1_DATABASE_ID"
+database_id = "3d95de0a-a817-482e-8999-dc22b226c8be"
 migrations_dir = "migrations"
 
 [[queues.producers]]
@@ -69,7 +70,7 @@ crons = ["*/5 * * * *"]
 [[env.staging.d1_databases]]
 binding = "OBSERVATORY_DB"
 database_name = "observatory-staging"
-database_id = "REPLACE_WITH_OBSERVATORY_STAGING_D1_DATABASE_ID"
+database_id = "c3b7676f-1c16-4f1e-b426-5bdf6773a51b"
 migrations_dir = "migrations"
 
 [[env.staging.queues.producers]]
