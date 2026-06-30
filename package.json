@@ -2,12 +2,14 @@
   "name": "observatory",
   "version": "1.0.0",
   "type": "module",
+  "workspaces": [
+    "ui"
+  ],
   "scripts": {
     "preinstall": "bunx only-allow bun",
     "start": "wrangler dev --local",
     "dev": "wrangler dev --local",
     "build": "cd ui && bun run build",
-    "deploy": "wrangler deploy",
     "db:migrate:local": "wrangler d1 migrations apply observatory --local",
     "db:migrate:remote": "wrangler d1 migrations apply observatory --remote",
     "test": "bun test",

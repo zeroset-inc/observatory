@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [react()],
   envDir: path.resolve(__dirname, ".."),
   resolve: {
+    preserveSymlinks: true,
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
