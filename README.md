@@ -131,27 +131,45 @@ Deployments are owned by Cloudflare Workers now. The Worker is bound to custom d
 - Production: `observatory.zeroset.com`
 - Staging: `observatory-staging.zeroset.com`
 
-Cloudflare setup and deployment are automated through GitHub Actions:
+Cloudflare infrastructure bootstrap is automated through GitHub Actions, while routine deployments run through Cloudflare Workers Builds:
 
 - `Bootstrap Cloudflare Observatory` is a manual setup/repair workflow. It resolves or creates the target D1 database by name, injects the database ID into `wrangler.toml`, creates the target Queue if missing, applies D1 migrations, syncs Worker secrets, optionally removes conflicting DNS records, and deploys the selected Worker environment.
-- `Deploy Observatory Worker` is the routine deploy workflow. It runs automatically for production on pushes to `main`, and can be manually dispatched for staging. It resolves existing resources, applies migrations, syncs Worker secrets, and deploys the Worker without mutating DNS or creating infrastructure.
 
-One-time GitHub Actions configuration in `zeroset-inc/observatory`:
+One-time GitHub Actions bootstrap configuration in `zeroset-inc/observatory`:
 
 ```bash
 gh variable set CLOUDFLARE_ACCOUNT_ID --repo zeroset-inc/observatory --body <account-id>
 gh secret set CLOUDFLARE_BOOTSTRAP_API_TOKEN --repo zeroset-inc/observatory
-gh secret set CLOUDFLARE_API_TOKEN --repo zeroset-inc/observatory
 gh secret set OBSERVATORY_SECRET --repo zeroset-inc/observatory
 ```
 
 `CLOUDFLARE_BOOTSTRAP_API_TOKEN` should be Observatory-specific and scoped to the target account/zones with Workers, D1, Queues, Worker custom-domain/route permissions, and `zeroset.com` Zone DNS Read/Edit. DNS access is required only for bootstrap-time cutover so the workflow can replace old ingress records before assigning the Worker custom domain.
 
-`CLOUDFLARE_API_TOKEN` is the narrower routine deploy token. It needs enough account permissions to list the existing D1 database and Queue, apply D1 migrations, sync Worker secrets, and deploy the Worker, but it does not need zone DNS edit.
-
-Run `Bootstrap Cloudflare Observatory` once per environment, or when repairing Cloudflare resources. Pushes to `main` deploy production. Use the `Deploy Observatory Worker` workflow dispatch target `staging` for staging deploys.
+Run `Bootstrap Cloudflare Observatory` once per environment, or when repairing Cloudflare resources. Pushes to `main` deploy production through Cloudflare Workers Builds once the Worker build is connected to the repository.
 
 Custom-domain cutover is handled by the bootstrap workflow for exact `observatory*.zeroset.com` DNS records when `cutover_dns` is enabled.
+
+### Cloudflare Workers Builds
+
+Routine production deploys run through Cloudflare Workers Builds. Configure the Worker build with repository root as the root directory, then use:
+
+```bash
+bun run build:cloudflare
+```
+
+Deploy command:
+
+```bash
+bun run deploy:cloudflare:production
+```
+
+Set `CLOUDFLARE_ACCOUNT_ID` as a build variable. Also set `SKIP_DEPENDENCY_INSTALL=true` so the build uses this repo's explicit Bun install commands, and optionally set `BUN_VERSION` to pin the Bun runtime. The Workers Builds API token must be able to list D1 databases, list Queues, apply D1 migrations, and deploy the Worker. Set `OBSERVATORY_SECRET` as a Worker runtime secret in Cloudflare; Workers Builds build variables are not runtime secrets.
+
+For staging, connect a staging branch/Worker build that uses:
+
+```bash
+bun run deploy:cloudflare:staging
+```
 
 Benchmark and comparison execution runs through Cloudflare Queues and Durable Objects. The Worker handles HTTP, Nebula-backed user auth, validation, D1 reads/writes, and queue dispatch; long-running orchestration is kept out of request and `waitUntil` lifecycles. Observatory stores local profile projections and encrypted provider keys in D1, but signup, login, Google/GitHub OAuth, logout, and session validation are owned by the main Nebula auth service.
 
