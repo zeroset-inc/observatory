@@ -2,6 +2,9 @@
   "name": "observatory",
   "version": "1.0.0",
   "type": "module",
+  "workspaces": [
+    "ui"
+  ],
   "scripts": {
     "preinstall": "bunx only-allow bun",
     "start": "wrangler dev --local",
